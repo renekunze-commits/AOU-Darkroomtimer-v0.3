@@ -1,0 +1,8 @@
+# PlatformIO Build-Ordner in allen Unterprojekten ignorieren
+**/.pio/
+**/build/
+**/.vscode/
+
+# Betriebssystem-Dateien
+.DS_Store
+Thumbs.db

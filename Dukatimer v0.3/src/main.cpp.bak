@@ -1,0 +1,383 @@
+/* Main.cpp - DUKATIMER ESP32-S3
+   Version: 0.3.2 (Matrix Rewrite)
+
+   Verantwortlichkeiten:
+   - Initialisiert Hardware-Instanzen (Matrix, Sensoren, LCD)
+   - Lädt Einstellungen (EEPROM) und startet die UI
+   - Hält die Haupt-Loop minimal: Watchdog-Fütterung und Delegation
+
+   Design-Entscheidung:
+   - Die eigentliche Anwendungslogik läuft dezentral in Mode_* und Logic_* Dateien.
+   - `main` stellt nur die Hardware-Initialisierung und die minimalen globalen
+     Default-Variablen bereit, damit die Module unabhängig testbar bleiben.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <esp_task_wdt.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ESP32Encoder.h>
+#include <Adafruit_TSL2591.h>
+#include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal_I2C.h>
+
+#include "Config.h"
+#include "Types.h"
+#include "Globals.h"
+#include "DisplayManager.h"
+
+// =============================================================================
+// 1. GLOBALE VARIABLEN DEFINITION (Hier wird Speicher reserviert!)
+// =============================================================================
+
+// --- HARDWARE ---
+// Matrix
+Adafruit_NeoPixel pixels(NEOPIXEL_COUNT, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+
+// Sensoren
+Adafruit_TSL2591 tslBase = Adafruit_TSL2591(2591);
+OneWire oneWire(PIN_ONEWIRE);
+DallasTemperature sensors(&oneWire);
+
+// LCD (I2C) - 20x4 Display auf Adresse 0x27
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// --- SYSTEM STATE ---
+SettingsObject globalSet;
+bool settingsDirty = false;
+unsigned long lastSettingChange = 0;
+
+bool tslBaseOK = false;
+bool lcdOK = false;
+bool nextonOK = false;
+bool tempSensorOK = false;
+bool neoPixelOK = false;
+bool overheatLock = false;
+double tempAlu = 0.0;
+int currentGainIdx = 0; // Für Densitometer
+bool sgShiftModeDensity = false; // false = Grade Shift, true = Density Shift
+
+// Legacy software focus toggle (toggled via Nextion bFocus)
+bool whiteLatch = false;
+// --- TIMER STATUS ---
+unsigned long starttime = 0;
+
+// Default Werte (werden später durch loadSettings überschrieben)
+double time_soft = 10.0;
+double time_hard = 0.0;  // 0.0 = Auto-Berechnung im Smart-Mode
+double time_bw   = 12.0;
+double grade_bw  = 2.5;
+double burnEv    = 0.0;
+
+double burnGrade = 2.5;
+uint8_t set_safe = 255;
+uint8_t set_focus = 255;
+uint8_t set_lcd = 100;
+uint8_t set_max = 255;
+StepSize globalStepMode = STEP_THIRD;
+
+Mode currentMode = MODE_BW;
+BurnMode burnMode = BURN_OFF;
+SplitState splitState = SPLIT_IDLE;
+
+// UI / Tracking
+double trackDensityEV = 0.0;
+double trackGradeSteps = 0.0;
+String overlayText = "";
+unsigned long infoEndTime = 0;
+int pendingPaperSlot = -1;
+
+// Hilfstabellen
+int multival[11][3] = { {0,255,0}, {0,235,20}, {0,215,40}, {0,195,60}, {0,170,85}, {0,143,112}, {0,115,140}, {0,85,170}, {0,60,200}, {0,30,225}, {0,0,255} };
+double paperSpeed[11] = { 1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.1, 1.3, 1.6, 2.0 };
+
+// Wizards & States
+CalStep calState = CAL_IDLE; bool calAbort = false;
+DensitometerState densState = DENS_IDLE; DensSubMode densSub = DENS_SUB_MANUAL;
+double densRefLux = 0.0; double densBaseFog = NAN; double zone8TargetNet = 1.20;
+
+// Teststrip
+TSState ts = TS_OFF; TSChannel tsCh = TS_BW;
+uint8_t tsN = DEFAULT_TS_N; double tsEv = DEFAULT_TS_EV; uint8_t tsK = 0;
+double tsA[10] = {0}; double tsSum = 0.0; bool tsActiveExposure = false;
+
+// Measurement
+MeasureMode measureMode = MM_OFF; unsigned long measureUiSinceMs = 0;
+double measSoftSum = 0.0; int measSoftCount = 0; double measHardSum = 0.0; int measHardCount = 0; double measBWSum = 0.0; int measBWCount = 0;
+
+// Pause / UI state
+bool isPaused = false;
+
+// --- MATHE ERGEBNISSE ---
+// (Definiert in Logic_Math.cpp)
+
+// Watchdog Helper - ESP32 Hardware Watchdog
+void wdt_reset_custom() { 
+  esp_task_wdt_reset();
+  yield(); 
+}
+void wdt_reset() { wdt_reset_custom(); }
+
+// =============================================================================
+// SETUP
+// =============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  #ifdef DEBUG_ENABLED
+  Serial.println("\n--- DUKATIMER BOOT ---");
+  #endif
+  
+  // ESP32 Watchdog konfigurieren (10 Sekunden Timeout)
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+  
+  pinMode(PIN_START,        INPUT_PULLUP);
+  pinMode(PIN_SW_ROOMLIGHT, INPUT_PULLUP);
+  pinMode(PIN_SW_FOCUS,     INPUT_PULLUP);
+  pinMode(PIN_SW_SAFE,      INPUT_PULLUP);
+  
+  pinMode(PIN_RELAY_ROOMLIGHT, OUTPUT);
+  pinMode(PIN_BUZZER,          OUTPUT);
+
+  digitalWrite(PIN_RELAY_ROOMLIGHT, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  // I2C Bus initialisieren mit Timeout
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init I2C Bus...");
+  #endif
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setTimeout(100); // 100ms Timeout
+  delay(100);
+  #ifdef DEBUG_ENABLED
+  Serial.println("I2C OK");
+  #endif
+  
+  // I2C LCD initialisieren mit Fehlerbehandlung
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init LCD...");
+  #endif
+  lcdOK = false;
+  Wire.beginTransmission(0x27); // 20x4 LCD I2C Standard-Adresse
+  if (Wire.endTransmission() == 0) {
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("Dukatimer v0.3");
+    lcd.setCursor(0, 1);
+    lcd.print("Booting...");
+    lcdOK = true;
+    #ifdef DEBUG_ENABLED
+    Serial.println("LCD OK");
+    #endif
+  } else {
+    #ifdef DEBUG_ENABLED
+    Serial.println("LCD FEHLT - weiter ohne Display");
+    #endif
+  }
+  delay(300);
+  
+  // TSL2591 Sensor initialisieren
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init TSL2591...");
+  #endif
+  tslBaseOK = false;
+  if (tslBase.begin()) {
+    tslBase.setGain(TSL2591_GAIN_MED);
+    tslBase.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+    currentGainIdx = 1;
+    tslBaseOK = true;
+    #ifdef DEBUG_ENABLED
+    Serial.println("TSL2591 OK");
+    #endif
+  } else {
+    #ifdef DEBUG_ENABLED
+    Serial.println("TSL2591 FEHLT - Densitometer deaktiviert");
+    #endif
+  }
+  
+  // Dallas Temperatursensor initialisieren
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init DS18B20...");
+  #endif
+  tempSensorOK = false;
+  sensors.begin();
+  delay(100);
+  if (sensors.getDeviceCount() > 0) {
+    tempSensorOK = true;
+    #ifdef DEBUG_ENABLED
+    Serial.print("DS18B20 OK - ");
+    Serial.print(sensors.getDeviceCount());
+    Serial.println(" Sensor(en) gefunden");
+    #endif
+  } else {
+    #ifdef DEBUG_ENABLED
+    Serial.println("DS18B20 FEHLT - Temperatur-Überwachung deaktiviert");
+    #endif
+  }
+  
+  // Input (Encoder + Buttons) - immer aktiv
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init Input...");
+  #endif
+  initInput();
+  #ifdef DEBUG_ENABLED
+  Serial.println("Input OK");
+  #endif
+  
+  // NeoPixel Matrix initialisieren
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init NeoPixels...");
+  #endif
+  neoPixelOK = false;
+  pixels.begin();
+  pixels.clear();
+  pixels.show();
+  delay(50);
+  // Test: kurz grün blinken
+  pixels.fill(pixels.Color(0, 20, 0));
+  pixels.show();
+  delay(100);
+  pixels.clear();
+  pixels.show();
+  neoPixelOK = true;
+  #ifdef DEBUG_ENABLED
+  Serial.println("NeoPixels OK");
+  #endif
+  
+  // Displays (Nextion) - mit Connection-Test
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init Nextion...");
+  #endif
+  nextonOK = false;
+  initDisplays();
+  delay(200);
+  if (DM_testConnection(1000)) {
+    nextonOK = true;
+    #ifdef DEBUG_ENABLED
+    Serial.println("Nextion OK");
+    #endif
+  } else {
+    #ifdef DEBUG_ENABLED
+    Serial.println("Nextion FEHLT - nur LCD-Betrieb");
+    #endif
+  }
+  
+  // EEPROM initialisieren
+  #ifdef DEBUG_ENABLED
+  Serial.println("Init EEPROM...");
+  #endif
+  EEPROM.begin(512);
+  #ifdef DEBUG_ENABLED
+  Serial.println("EEPROM OK");
+  #endif
+  
+  // Settings laden
+  #ifdef DEBUG_ENABLED
+  Serial.println("Load Settings...");
+  #endif
+  loadSettings();
+  #ifdef DEBUG_ENABLED
+  Serial.println("Settings OK");
+  #endif
+  
+  // UI Update (nur wenn Display vorhanden)
+  if (nextonOK) {
+    updateNextionUI(true);
+  }
+  
+  // Boot-Status auf LCD
+  if (lcdOK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("System Ready");
+    lcd.setCursor(0, 1);
+    String status = "";
+    if (tslBaseOK) status += "L";
+    if (tempSensorOK) status += "T";
+    if (neoPixelOK) status += "M";
+    if (nextonOK) status += "N";
+    lcd.print("HW: " + status);
+  }
+  
+  Serial.println("System ready");
+}
+
+
+
+void loop() {
+  wdt_reset();
+  
+  // Haupt-Funktionen (nicht-blockierend)
+  handleTimer();     // Timer-Engine für Belichtungen
+  handleLights();    // Matrix + Relais Steuerung
+  DM_loop();         // Display Manager (Nextion Queue)
+  
+  // Input-Handling (Encoder + Buttons)
+  static long oldPosSoft = 0;
+  static long oldPosHard = 0;
+  static long oldPosGrade = 0;
+  
+  long dSoft = encSoft.getCount() - oldPosSoft;
+  long dHard = encHard.getCount() - oldPosHard;
+  long dGrade = encGrade.getCount() - oldPosGrade;
+  
+  // Soft Encoder (Zeit BW / Soft)
+  if (dSoft != 0) {
+    if (currentMode == MODE_BW) {
+      time_bw += (dSoft * 0.1);
+      validateTimes();
+    } else if (currentMode == MODE_SG) {
+      time_soft += (dSoft * 0.1);
+      validateTimes();
+    }
+    triggerInfo();
+    oldPosSoft = encSoft.getCount();
+  }
+  
+  // Hard Encoder (Zeit Hard)
+  if (dHard != 0 && currentMode == MODE_SG) {
+    time_hard += (dHard * 0.1);
+    validateTimes();
+    triggerInfo();
+    oldPosHard = encHard.getCount();
+  }
+  
+  // Grade Encoder (Gradation / Burn)
+  if (dGrade != 0) {
+    if (burnMode != BURN_OFF) {
+      burnEv += (dGrade * 0.1);
+      burnEv = clampDouble(burnEv, -3.0, 3.0);
+    } else if (currentMode == MODE_BW) {
+      grade_bw += (dGrade * 0.1);
+      validateTimes();
+      updateGradeMath();
+    }
+    triggerInfo();
+    oldPosGrade = encGrade.getCount();
+  }
+  
+  // Start-Taste (Footswitch / Button)
+  if (checkButtonPress(btnStart, PIN_START)) {
+    if (starttime == 0) {
+      startTimer();
+      beepStartPattern();
+    } else {
+      stopTimer();
+      beepEndPattern();
+    }
+  }
+  
+  // UI Update (throttled)
+  static unsigned long lastUI = 0;
+  if (millis() - lastUI > 100) {
+    updateNextionUI(false);
+    lastUI = millis();
+  }
+  
+  delay(5);
+}

@@ -1,0 +1,39 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+// Standard ESP32 Pins
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Serial.println("\nI2C Scanner gestartet");
+}
+
+void loop() {
+  byte error, address;
+  int nDevices = 0;
+
+  Serial.println("Scanne Bus...");
+
+  for(address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C Gerät gefunden an Adresse 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+  }
+  
+  if (nDevices == 0) {
+    Serial.println("Keine I2C Geräte gefunden. Bitte Kabel prüfen!");
+  } else {
+    Serial.println("Scan abgeschlossen.\n");
+  }
+  
+  delay(5000);
+}

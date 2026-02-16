@@ -1,0 +1,19 @@
+Entwicklung UI
+
+
+0 Main -> Start-Seite
+Nextion Editor 				-> ESP32
+btMNU Dualstate  id8  pic 25 pic2 9 	-> Menü
+btSW Dualstate   id1 pic 15 pic2 1 	-> Schwarz Weiß Modus BW
+btSG Dualstate   id2 pic 19 pic2 2	-> Splitgrade Modus SG
+btDENS Dualstate id3 pic 23 pic2 7	-> Densitometer Modus
+btSTR Taster	 id5 pic 27 pic2 12	-> * Taste Enter/Bestätigen
+btSL Dualstate   id7 pic 28 pic2 13 	-> Savelight Neopixel rot, Priorität Funktion wie Schalter PIN 21, zeigt Status Schalter 21
+btFOC Dualstate  id6 pic 29 pic2 14	-> Focus Licht (Neopixel weiß), Funktion wie Schalter PIN 14, zeigt Status Schalter 14
+btSCR Dualstate id9 pic 24 pic2 8 	-> LCD Beleuchtung aus, Neopixel aus, Funktion wie Schalter PIN 13, zeigt Status Schalter 13
+btHSH Taster id4 pic 17 pic2 10		-> kurz drücken Zurück / lang drücken Einstellung zurücksetzen
+
+
+tTempA id11				-> Anzeige Temperatur Alu/LED
+tPow id14				-> Anzeige Leistung Neopixel in 0 von 255
+tTempR id16 				-> Anzeige Raumtemperatur BMP280 an I2C slow

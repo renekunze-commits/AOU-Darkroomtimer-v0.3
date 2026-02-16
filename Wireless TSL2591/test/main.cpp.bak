@@ -1,0 +1,158 @@
+/* ============================================================================
+   ESP32-C3 WIRELESS PROBE - TSL2591 + OLED
+   ============================================================================ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_TSL2591.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- KONFIGURATION ---
+#define REMOTE_MAGIC 0xD4
+#define SEND_INTERVAL_MS 200
+
+// I2C Pins (ESP32-C3 SuperMini)
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+// Display Einstellungen
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C // Standard fuer die meisten I2C OLEDs
+
+// --- DATENSTRUKTUR ---
+struct WirelessPacket {
+    uint8_t magic;
+    uint32_t seq;
+    float lux;
+};
+
+// --- GLOBALE VARIABLEN ---
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+uint32_t seqCounter = 0;
+bool lastTxSuccess = false;
+
+// --- CALLBACK FUR SENDE-STATUS ---
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  lastTxSuccess = (status == ESP_NOW_SEND_SUCCESS);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. I2C Starten
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // 2. Display Initialisierung
+  // Temporarily comment out OLED initialization to debug bootloop
+  // if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+  //   Serial.println(F("SSD1306 allocation failed"));
+  //   // We continue without the display
+  // }
+  // display.clearDisplay();
+  // display.setTextSize(1);
+  // display.setTextColor(SSD1306_WHITE);
+  // display.setCursor(0, 0);
+  // display.println(F("Booting Probe..."));
+  // display.display();
+
+  // 3. Sensor Initialisierung
+  // Temporarily comment out TSL2591 sensor initialization
+  // if (!tsl.begin()) {
+  //   Serial.println(F("TSL2591 not found!"));
+  //   // display.println(F("ERR: No Sensor!"));
+  //   // display.display();
+  //   while (1) delay(100);
+  // }
+
+  // Gain/Timing Setup
+  // tsl.setGain(TSL2591_GAIN_MED);
+  // tsl.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+
+  // 4. WiFi & ESP-NOW
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    display.println(F("ESP-NOW Fail"));
+    display.display();
+    ESP.restart();
+  }
+
+  // Register Callback
+  esp_now_register_send_cb(OnDataSent);
+
+  // Register Peer
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Peer add fail");
+  }
+
+  display.clearDisplay();
+}
+
+void loop() {
+  // --- A. MESSEN ---
+  uint32_t lum = tsl.getFullLuminosity();
+  uint16_t ir = lum >> 16;
+  uint16_t full = lum & 0xFFFF;
+  float lux = tsl.calculateLux(full, ir);
+  if (lux < 0.0001) lux = 0.0;
+
+  // --- B. SENDEN ---
+  WirelessPacket packet;
+  packet.magic = REMOTE_MAGIC;
+  packet.seq = seqCounter++;
+  packet.lux = lux;
+
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &packet, sizeof(packet));
+
+  // --- C. ANZEIGEN (UI UPDATE) ---
+  display.clearDisplay();
+
+  // Header Zeile
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(F("W-Probe  #"));
+  display.print(packet.seq % 1000); // Kurzform Seq
+
+  // Status Symbol oben rechts
+  display.setCursor(110, 0);
+  if (result == ESP_OK) {
+    display.print(F("TX")); // Senden angestossen
+  } else {
+    display.print(F("!!")); // Sende-Fehler
+  }
+
+  // Lux Wert (Gross)
+  display.setCursor(0, 16);
+  if (lux < 10.0) display.setTextSize(4); // Sehr gross fuer kleine Werte
+  else if (lux < 1000.0) display.setTextSize(3);
+  else display.setTextSize(2);
+
+  display.print(lux, (lux < 10) ? 2 : 1);
+
+  // Einheit und Zusatzinfos unten
+  display.setTextSize(1);
+  display.setCursor(110, 40);
+  display.print(F("lx"));
+
+  display.setCursor(0, 56);
+  display.print(F("IR:"));
+  display.print(ir);
+
+  // Anzeige aktualisieren
+  display.display();
+
+  delay(SEND_INTERVAL_MS);
+}
