@@ -44,11 +44,18 @@ bool bootScreenActive = true; // Hält den Sensor-Status am Anfang
 bool setupMenuActive = false;
 
 // =============================================================================
-// WIRELESS SENSOR (ESP-NOW)
+// WIRELESS SENSOR (ESP-NOW Bidirektional)
 // =============================================================================
 bool useWirelessProbe = false;         // Standard: Kabelgebunden
 volatile double remoteLux = 0.0;
 volatile unsigned long lastRemotePacketMs = 0;
+volatile uint8_t probeLastEvent = 0;   // EVT_NONE
+volatile float   probeLuxG0 = 0.0f;
+volatile float   probeLuxG5 = 0.0f;
+volatile bool    probeEventPending = false;
+volatile bool    probeConnected = false;
+bool probeFlashActive = false;
+bool measurementOverrideActive = false;
 
 TwoWire& I2C_SLOW = Wire;
 TwoWire I2C_FAST = TwoWire(1);
@@ -66,7 +73,7 @@ bool bmpOK = false, tempSensorOK = false, neoPixelOK = false, overheatLock = fal
 double tempAlu = 0.0;
 double tempRoom = 0.0;
 int currentGainIdx = 0;
-bool whiteLatch = false, safeLatch = false, screenOffOverride = false;
+bool whiteLatch = false, safeLatch = false, roomLatch = false, screenOffOverride = false;
 
 unsigned long starttime = 0;
 double time_soft = 10.0, time_hard = 0.0, time_bw = 12.0, grade_bw = 2.5;
@@ -87,6 +94,12 @@ double measSoftSum = 0.0; int measSoftCount = 0;
 double measHardSum = 0.0; int measHardCount = 0;
 double measBWSum = 0.0; int measBWCount = 0;
 MeasureMode measureMode = MM_OFF;
+MeasureFocus currentMeasureFocus = FOCUS_HIGHLIGHTS;
+MeasureState currentMeasureState = MEASURE_IDLE;
+float timer_base_seconds = 0.0;
+uint8_t currentZoneHistogram[11] = {0};
+double targetDoseSoft = 0.0;
+double targetDoseHard = 0.0;
 unsigned long measureUiSinceMs = 0;
 
 TSState ts = TS_OFF;
@@ -334,6 +347,90 @@ delay(500);
 }
 
 // =============================================================================
+// FLASH-HANDSHAKE STATE MACHINE & PROBE DISPLAY
+// =============================================================================
+// Architektur: Asynchrone, deterministische Kommunikation S3 (Licht) <-> C6 (Auge).
+// Phase 1: S3 schaltet NeoPixel G0 (Gruen), sendet CMD_MEASURE_G0 an C6
+// Phase 2: C6 misst, sendet EVT_LUX_DATA -> S3 schaltet G5 (Blau), CMD_MEASURE_G5
+// Phase 3: C6 misst, sendet EVT_LUX_DATA -> S3 verarbeitet Dual-Messwert
+// Timeout: 3s -> automatischer Abort. Blockiert NICHT den Main Loop.
+//
+// Input Merging: Lokale Hardware (Taster, Encoder) und Remote-Events (ESP-NOW)
+// werden ZUERST in logische Action-Flags zusammengefuehrt, BEVOR die Modi-Logik
+// sie verarbeitet. Die Modi wissen nicht, woher der Klick kam.
+// =============================================================================
+
+extern portMUX_TYPE luxMux;  // Definiert in HW_Wireless.cpp
+
+// Tick: Wird jeden Loop-Durchlauf aufgerufen.
+// Konsumiert EVT_LUX_DATA Events. Gibt true zurueck wenn Event verarbeitet wurde.
+bool tickFlashHandshake(uint8_t evt, float luxG0, float luxG5) {
+    return handleMeasurementStateMachine(evt, luxG0, luxG5);
+}
+
+void startFlashHandshake() {
+    triggerSpectralMeasurement();
+}
+
+void updateProbeDisplay() {
+    if (!probeConnected || currentMeasureState != MEASURE_IDLE) return;
+
+    char header[16] = {0};
+    char line1[16]  = {0};
+    char line2[16]  = {0};
+    uint8_t mode    = PMODE_IDLE;
+
+    if (starttime != 0) {
+        unsigned long elapsed = millis() - starttime;
+        snprintf(header, sizeof(header), "[ EXPOSURE ]");
+        snprintf(line1,  sizeof(line1),  "T: %.1fs", elapsed / 1000.0);
+        if (burnMode != BURN_OFF)
+            snprintf(line2, sizeof(line2), "BURN +%.1fEV", burnEv);
+        else
+            snprintf(line2, sizeof(line2), "%s", currentMode == MODE_BW ? "BW" : "SG");
+        mode = PMODE_BURN;
+    }
+    else if (isMeteringActive()) {
+        if (currentMode == MODE_BW) {
+            snprintf(header, sizeof(header), "[ BW METER ]");
+            snprintf(line1,  sizeof(line1),  "Spots: %d", measBWCount);
+            if (measBWCount > 0)
+                snprintf(line2, sizeof(line2), "avg:%.1f T2=ADD", measBWSum / (double)measBWCount);
+            else
+                snprintf(line2, sizeof(line2), "T2=ADD ENC=OK");
+            mode = PMODE_METER_BW;
+        } else {
+            bool isSoft = (measureMode == MM_APPLY_SG_G0);
+            int cnt = isSoft ? measSoftCount : measHardCount;
+            snprintf(header, sizeof(header), "[ SG %s ]", isSoft ? "SOFT" : "HARD");
+            snprintf(line1,  sizeof(line1),  "Spots: %d", cnt);
+            snprintf(line2,  sizeof(line2),  "T2=ADD T1=TOG");
+            mode = PMODE_METER_SG;
+        }
+    }
+    else if (burnMode != BURN_OFF) {
+        snprintf(header, sizeof(header), "[ BURN ]");
+        snprintf(line1,  sizeof(line1),  "EV: +%.1f", burnEv);
+        double bt = getEffectiveBurnTime();
+        snprintf(line2,  sizeof(line2),  "T:%.1fs T2=GO", bt);
+        mode = PMODE_BURN;
+    }
+    else {
+        if (currentMode == MODE_BW) {
+            snprintf(header, sizeof(header), "[ BW ]");
+            snprintf(line1,  sizeof(line1),  "T:%.1fs G:%.1f", time_bw, grade_bw);
+        } else {
+            snprintf(header, sizeof(header), "[ SPLITGRADE ]");
+            snprintf(line1,  sizeof(line1),  "S:%.1f H:%.1f", time_soft, time_hard);
+        }
+        snprintf(line2, sizeof(line2), "T2=METER");
+        mode = PMODE_IDLE;
+    }
+
+    sendProbeRender(header, line1, line2, nullptr, HAPTIC_NONE, mode);
+}
+
+// =============================================================================
 // LOOP
 // =============================================================================
 
@@ -378,8 +475,36 @@ void loop() {
   handleLights();
   DM_loop();
 
-  // Metering input (encoder buttons)
+  // =====================================================================
+  // 1. ATOMICALLY READ PROBE EVENT
+  // =====================================================================
+  uint8_t probeEvt = EVT_NONE;
+  float   pLuxG0 = 0.0f, pLuxG5 = 0.0f;
+    popProbeEvent(probeEvt, pLuxG0, pLuxG5);
+
+    // Fokus-Umschaltung (Lichter <-> Schatten) per Remote-Encoder.
+    // Sofortiges Render-Feedback ans C6 OLED.
+    if (isMeteringActive() && (probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN)) {
+        currentMeasureFocus = (currentMeasureFocus == FOCUS_HIGHLIGHTS)
+            ? FOCUS_SHADOWS : FOCUS_HIGHLIGHTS;
+        sendRenderPacketToC6();
+        probeEvt = EVT_NONE;
+    }
+
+  // =====================================================================
+  // 2. TICK FLASH-HANDSHAKE (konsumiert EVT_LUX_DATA)
+  // =====================================================================
+  if (tickFlashHandshake(probeEvt, pLuxG0, pLuxG5)) {
+      probeEvt = EVT_NONE; // Consumed
+  }
+  if (probeEvt == EVT_HEARTBEAT) probeEvt = EVT_NONE;
+
+  // =====================================================================
+  // 3. COLLECT LOCAL INPUTS
+  // =====================================================================
   unsigned long now = millis();
+
+  // Grade-Encoder Button (Short/Long Press)
   static bool gradePressed = false;
   static bool gradeLongHandled = false;
   static unsigned long gradePressStart = 0;
@@ -402,127 +527,203 @@ void loop() {
   }
 
   bool evEnter = checkButtonPress(sEnter, PIN_SW_ENTER);
-  bool evBack = checkButtonPress(sBack, PIN_SW_BACK);
+  bool evBack  = checkButtonPress(sBack,  PIN_SW_BACK);
   bool evStart = checkButtonPress(btnStart, PIN_START);
 
-  if (isMeteringActive()) {
-    bool toggleChannel = (currentMode == MODE_SG) && evBack;
-    bool cancel = (currentMode != MODE_SG) && evBack;
-    handleMeteringSession(gradeShort, evEnter, toggleChannel, gradeLong, cancel);
-    delay(5);
-    return;
-  }
-
-  if (gradeShort) {
-    startMeteringSession();
-    delay(5);
-    return;
-  }
-
-  // EV-Stufen umschalten
-  if (evEnter) {
-    int nextStep = (int)globalStepMode + 1;
-    if (nextStep > 3) nextStep = 0;
-    globalStepMode = (StepSize)nextStep;
-    beepValue();
-    triggerInfo();
-  }
-
-  // Encoder Auswertung
+  // Encoder Deltas (lokale Drehgeber)
   static long oldPosSoft = curSoft, oldPosHard = curHard, oldPosGrade = curGrade;
-  long dSoft = curSoft - oldPosSoft;
-  long dHard = curHard - oldPosHard;
+  long dSoft  = curSoft  - oldPosSoft;
+  long dHard  = curHard  - oldPosHard;
   long dGrade = curGrade - oldPosGrade;
 
-  double evStepFactor = 1.0;
-  if (globalStepMode == STEP_HALF)  evStepFactor = 0.5;
-  if (globalStepMode == STEP_THIRD) evStepFactor = 1.0/3.0;
-  if (globalStepMode == STEP_SIXTH) evStepFactor = 1.0/6.0;
+  // =====================================================================
+  // 4. SUPPRESS INPUT DURING ASYNC MEASUREMENT
+  // =====================================================================
+  // Waehrend Flash-Handshake (C6-Sensor) oder Async-Spot (lokaler Sensor)
+  // laeuft: Nur die Messung ticken, alle Eingaben verwerfen.
+    bool skipModeLogic = false;
+    if (currentMeasureState != MEASURE_IDLE || isAsyncSpotBusy()) {
+      if (isMeteringActive()) handleMeteringSession(false, false, false, false, false);
 
-  if (dSoft != 0) {
-    if (currentMode == MODE_BW) time_bw *= pow(2.0, dSoft * evStepFactor);
-    else if (currentMode == MODE_SG) time_soft *= pow(2.0, dSoft * evStepFactor);
-    validateTimes();
-    triggerInfo();
-    oldPosSoft = curSoft;
+            // Not-Aus: START als Abbruchsignal während aktiver Spektralmessung zulassen.
+            if (currentMeasureState != MEASURE_IDLE && (evStart || probeEvt == EVT_T2_CLICK)) {
+                abortMeasurementWithError("ABORT");
+                probeEvt = EVT_NONE;
+            }
+
+      oldPosSoft = curSoft;
+      oldPosHard = curHard;
+      oldPosGrade = curGrade;
+      skipModeLogic = true;
   }
 
-  if (dHard != 0 && currentMode == MODE_SG) {
-    if (time_hard < TIME_MIN_S) time_hard = TIME_MIN_S;
-    else time_hard *= pow(2.0, dHard * evStepFactor);
-    validateTimes();
-    triggerInfo();
-    oldPosHard = curHard;
-  }
+  // =====================================================================
+  // 5. INPUT MERGING & MODE DISPATCH
+  // =====================================================================
+  // Lokale Hardware (Taster, Encoder) und Remote-Events (ESP-NOW) werden
+  // ZUERST in logische Action-Flags zusammengefuehrt. Die Modi wissen
+  // nicht, woher der Klick kam. → Single Source of Truth
+  // =====================================================================
+  if (!skipModeLogic) {
 
-  if (dGrade != 0) {
-    if (burnMode != BURN_OFF) {
-      // Burn-EV Wert begrenzen: Standard 0.0 bis 3.0 (kein negatives Dodging)
-      // Wenn negative Werte erlaubt sind: burnEv = constrain(burnEv, -3.0, 3.0);
-      burnEv += (dGrade * evStepFactor);
-      burnEv = constrain(burnEv, 0.0, 3.0);
-      beepValue();
-    } else if (currentMode == MODE_BW) {
-      grade_bw += (dGrade * 0.1);
-      grade_bw = constrain(grade_bw, 0.0, 5.0);
-      validateTimes();
-      updateGradeMath();
+    double evStepFactor = 1.0;
+    if (globalStepMode == STEP_HALF)  evStepFactor = 0.5;
+    if (globalStepMode == STEP_THIRD) evStepFactor = 1.0/3.0;
+    if (globalStepMode == STEP_SIXTH) evStepFactor = 1.0/6.0;
+
+    // -----------------------------------------------------------------
+    // A) TIMER LAEUFT → nur Stop erlauben
+    // -----------------------------------------------------------------
+    if (starttime != 0) {
+        bool actionStop = evStart
+                       || (probeEvt == EVT_T2_CLICK)
+                       || (probeEvt == EVT_T1_CLICK);
+        if (actionStop) {
+            stopTimer();
+            if (probeConnected)
+                sendProbeRender("[ STOPPED ]", "Timer aborted", "", nullptr, HAPTIC_CLICK, PMODE_IDLE);
+        }
     }
-    triggerInfo();
-    oldPosGrade = curGrade;
-  }
+    // -----------------------------------------------------------------
+    // B) METERING AKTIV → Spot/Save/Toggle/Cancel (lokal + remote)
+    // -----------------------------------------------------------------
+    else if (isMeteringActive()) {
+        bool actionAddLocal  = gradeShort;
+        bool actionAddRemote = (probeEvt == EVT_T2_CLICK);
+        bool actionSave      = evEnter || (probeEvt == EVT_ENC_CLICK);
+        bool actionToggle    = (currentMode == MODE_SG) &&
+                               (evBack || probeEvt == EVT_T1_CLICK
+                                || probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN);
+        bool actionCancel    = (currentMode != MODE_SG) &&
+                               (evBack || probeEvt == EVT_T1_CLICK);
+        bool actionReset     = gradeLong;
 
-  // ---------------------------------------------------------------------------
-  // Burn-Mode Toggle per langem Tastendruck auf Grade-Encoder
-  // ---------------------------------------------------------------------------
-  // Früher wurde Burn-Mode über das Zeichen 'C' getriggert (handleIdleInput).
-  // Da Nextion-Touch-Events jetzt direkt abgearbeitet werden, ist das Aktivieren
-  // des Burn-Modes nur noch über den Encoder sinnvoll. Ein langer Druck auf den
-  // Grade-Encoder toggelt den Burn-Mode:
-  //   - MODE_SG: BURN_OFF → BURN_SG_G0 → BURN_SG_G5 → BURN_OFF
-  //   - MODE_BW: BURN_OFF → BURN_BW → BURN_OFF
-  // Vorteil: Dead Code in Logic_Timer.cpp wird wieder nutzbar, UI bleibt intuitiv.
-  if (gradeLong && !isMeteringActive()) {
-      if (currentMode == MODE_SG) {
-          if (burnMode == BURN_OFF) burnMode = BURN_SG_G0;
-          else if (burnMode == BURN_SG_G0) burnMode = BURN_SG_G5;
-          else burnMode = BURN_OFF;
-      } else {
-          if (burnMode == BURN_OFF) { burnMode = BURN_BW; burnGrade = grade_bw; }
-          else burnMode = BURN_OFF;
-      }
-      burnEv = 0.0;
-      beepValue();
-      triggerInfo();
-  }
+        if (actionAddRemote) {
+            // Remote-Messung: Flash-Handshake (C6 misst ueber Probe-Sensor)
+            startFlashHandshake();
+        } else {
+            // Lokal: addSpot startet non-blocking Async-Spot (S3-Sensor)
+            handleMeteringSession(actionAddLocal, actionSave, actionToggle, actionReset, actionCancel);
+        }
+    }
+    // -----------------------------------------------------------------
+    // C) IDLE / BURN → Meter starten, Timer, Encoder, Burn-Toggle
+    // -----------------------------------------------------------------
+    else {
+        // Metering starten (lokal: Grade-Short, remote: T2 im Nicht-Burn)
+        bool actionStartMeter = gradeShort
+                             || (probeEvt == EVT_T2_CLICK && burnMode == BURN_OFF);
+        if (actionStartMeter) {
+            startMeteringSession();
+        }
 
-  // Start-Taster (KORRIGIERT)
-  // Pieptöne werden jetzt ausschließlich von der Timer-Engine (Logic_Timer.cpp) gesteuert.
-  if (evStart) {
-    if (starttime == 0) { startTimer(); }
-    else { stopTimer(); }
-  }
+        // Timer starten (lokal: Start-Taster, remote: T2 im Burn-Modus)
+        else {
+            bool actionTimerToggle = evStart
+                                  || (probeEvt == EVT_T2_CLICK && burnMode != BURN_OFF);
+            if (actionTimerToggle) {
+                if (starttime == 0) {
+                    startTimer();
+                    if (probeConnected)
+                        sendProbeRender("[ EXPOSURE ]", "Timer started", "", nullptr, HAPTIC_CLICK, PMODE_BURN);
+                } else {
+                    stopTimer();
+                }
+            }
 
-  // UI Update
-// --- TEMPERATUR MESSUNG (Alle 2 Sekunden reicht völlig) ---
+            // EV-Stufe durchschalten (lokal: Enter, remote: Enc-Click)
+            bool actionStepCycle = evEnter || (probeEvt == EVT_ENC_CLICK);
+            if (actionStepCycle) {
+                int nextStep = (int)globalStepMode + 1;
+                if (nextStep > 3) nextStep = 0;
+                globalStepMode = (StepSize)nextStep;
+                beepValue();
+                triggerInfo();
+            }
+
+            // --- Lokale Encoder ---
+            if (dSoft != 0) {
+                if (currentMode == MODE_BW) time_bw *= pow(2.0, dSoft * evStepFactor);
+                else if (currentMode == MODE_SG) time_soft *= pow(2.0, dSoft * evStepFactor);
+                validateTimes();
+                triggerInfo();
+                oldPosSoft = curSoft;
+            }
+            if (dHard != 0 && currentMode == MODE_SG) {
+                if (time_hard < TIME_MIN_S) time_hard = TIME_MIN_S;
+                else time_hard *= pow(2.0, dHard * evStepFactor);
+                validateTimes();
+                triggerInfo();
+                oldPosHard = curHard;
+            }
+            if (dGrade != 0) {
+                if (burnMode != BURN_OFF) {
+                    burnEv += (dGrade * evStepFactor);
+                    burnEv = constrain(burnEv, 0.0, 3.0);
+                    beepValue();
+                } else if (currentMode == MODE_BW) {
+                    grade_bw += (dGrade * 0.1);
+                    grade_bw = constrain(grade_bw, 0.0, 5.0);
+                    validateTimes();
+                    updateGradeMath();
+                }
+                triggerInfo();
+                oldPosGrade = curGrade;
+            }
+
+            // --- Remote Encoder (C6 Drehgeber) ---
+            if (probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN) {
+                double dir = (probeEvt == EVT_ENC_UP) ? 1.0 : -1.0;
+                if (burnMode != BURN_OFF) {
+                    burnEv += (dir * evStepFactor);
+                    burnEv = constrain(burnEv, 0.0, 3.0);
+                    beepValue();
+                } else if (currentMode == MODE_BW) {
+                    time_bw *= pow(2.0, dir * evStepFactor);
+                } else if (currentMode == MODE_SG) {
+                    time_soft *= pow(2.0, dir * evStepFactor);
+                }
+                validateTimes();
+                triggerInfo();
+            }
+
+            // --- Burn-Mode Toggle (langer Grade-Encoder Druck) ---
+            if (gradeLong) {
+                if (currentMode == MODE_SG) {
+                    if (burnMode == BURN_OFF) burnMode = BURN_SG_G0;
+                    else if (burnMode == BURN_SG_G0) burnMode = BURN_SG_G5;
+                    else burnMode = BURN_OFF;
+                } else {
+                    if (burnMode == BURN_OFF) { burnMode = BURN_BW; burnGrade = grade_bw; }
+                    else burnMode = BURN_OFF;
+                }
+                burnEv = 0.0;
+                beepValue();
+                triggerInfo();
+            }
+        }
+    }
+  } // end if (!skipModeLogic)
+
+  // =====================================================================
+  // 6. HOUSEKEEPING (immer ausgefuehrt, auch waehrend Messung)
+  // =====================================================================
+
+  // --- TEMPERATUR MESSUNG (Alle 2 Sekunden) ---
   static unsigned long lastTemp = 0;
   static bool tempRequested = false;
-  
+
   if (millis() - lastTemp > 2000) {
     if (tempSensorOK) {
         if (!tempRequested) {
-            // REQUEST phase: Non-blocking request
             sensors.requestTemperatures();
             tempRequested = true;
         } else {
-            // READ phase: Get result from previous request (conversion has had 2+ seconds)
             float t = sensors.getTempCByIndex(0);
             if (t > -100 && t < 150) tempAlu = t;
             tempRequested = false;
         }
     }
-
-    // 2. Raum Sensor (BMP280) - Instant (~1ms), fine here
     if (bmpOK && bmpPtr != nullptr) {
        float t = bmpPtr->readTemperature();
        if (!isnan(t) && t > -50 && t < 80) tempRoom = t;
@@ -530,12 +731,46 @@ void loop() {
     lastTemp = millis();
   }
 
-  // --- UI UPDATE (Weiterhin 100ms für flüssige Bedienung) ---
+  // --- UI UPDATE (100ms) ---
   static unsigned long lastUI = 0;
   if (millis() - lastUI > 100) {
-    updateNextionUI(false); // Nimmt jetzt einfach den gespeicherten Wert von tempAlu
+    updateNextionUI(false);
     lastUI = millis();
   }
-  
+
+  // --- PROBE DISPLAY UPDATE (250ms) ---
+  if (probeConnected && (millis() - lastRemotePacketMs > 5000)) {
+      probeConnected = false;
+  }
+  {
+    static unsigned long lastProbeUpdate = 0;
+    if (probeConnected && millis() - lastProbeUpdate > 250) {
+        updateProbeDisplay();
+        lastProbeUpdate = millis();
+    }
+  }
+
+    // --- RUNTIME AUDIT TELEMETRY (nur bei Aenderung) ---
+    {
+        static uint32_t lastDropPkts = 0;
+        static uint32_t lastOverruns = 0;
+        static unsigned long lastAuditPrint = 0;
+        if (millis() - lastAuditPrint > 500) {
+            uint32_t dropNow = totalDroppedPackets;
+            uint32_t overNow = probeEventOverruns;
+            if (dropNow != lastDropPkts || overNow != lastOverruns) {
+                Serial.printf("[AUDIT] drop=%lu overrun=%lu qPending=%d conn=%d fh=%d\n",
+                    (unsigned long)dropNow,
+                    (unsigned long)overNow,
+                    probeEventPending ? 1 : 0,
+                    probeConnected ? 1 : 0,
+                    probeFlashActive ? 1 : 0);
+                lastDropPkts = dropNow;
+                lastOverruns = overNow;
+            }
+            lastAuditPrint = millis();
+        }
+    }
+
   delay(5);
 }

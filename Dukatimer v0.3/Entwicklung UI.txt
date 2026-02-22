@@ -1,19 +1,231 @@
-Entwicklung UI
+Dukatimer UI & Hardware Architektur
+Dieses Dokument definiert die strikte Trennung von Input-Handling, Modus-Logik und mathematischer Verarbeitung, um eine konsistente "Blindbedienung" in der Dunkelkammer zu gewährleisten.
+Die physikalische Grundarchitektur (Root Cause Engine)
+Um Logikfehler bei Papierwechseln, Teststreifen und mechanischen Änderungen am Vergrößerer an der Wurzel (Root Cause) auszuschließen, arbeitet das System intern nicht mit abstrakten Zeiten (Sekunden) und Gradationen, sondern ausschließlich mit physikalischen Einheiten:
+	1. Zieldosis (Lux-Sekunden): Die absolute Lichtmenge, die das Papier benötigt.
+	2. Spektrales Verhältnis (Grün/Blau): Definiert den Kontrast (und beeinflusst die Papiereffizienz).
+Die auf dem Display angezeigten Sekunden und Gradationswerte (0.0 - 5.0) sind reine UI-Repräsentationen. Das Drehen am Zeit-Encoder verschiebt intern die Zieldosis. Das Drehen am Gradations-Encoder verschiebt intern das G/B-Verhältnis.
+Allgemeine Hardware-Philosophie & Ausführungsregeln
+	• Encoder 1 (Links): Zuständig für Zieldosis (UI-Repräsentation: Zeit/EV) und Messung.
+	• Encoder 2 (Mitte): Zuständig für Dosis-Feintuning (UI-Repräsentation: +/- Sekunden) und Bestätigung (* / ENTER).
+	• Encoder 3 (Rechts): Zuständig für Spektral-Verhältnis (UI-Repräsentation: Kontrast/Grade) und Abbruch (# / BACK).
+	• Regel 1 (Akustisches Metronom): Während jeder Belichtungsphase (Base, Test Strip, Burn) läuft zwingend ein leises, akustisches Ticken im Sekunden- oder Halbsenkundentakt mit. Dies ist das primäre Feedback für den Nutzer, dass das System arbeitet (Heartbeat).
+Physische Schalter & Safety Latch Logik (Root Cause Protection)
+Um unbeabsichtigtes Verschleiern von Fotopapier (Fogging) und verfälschte Sensorwerte auszuschließen, nutzt das System 3 dedizierte Kippschalter. Die Logik basiert zwingend auf Flankenauswertung (Edge-Detection), nicht auf reiner Level-Abfrage.
+	1. Schalter 1 (Focus): Weißlicht des Vergrößerers zum Einrichten und Fokussieren.
+	2. Schalter 2 (Safelight): Integrierte rote Sicherheitsbeleuchtung (z.B. rote LEDs am Vergrößerer-Kopf).
+	3. Schalter 3 (Mess-Dunkelheit / Relais): Steuert die externe rote Raumbeleuchtung der Dunkelkammer und die Displays.
+Die Interlock- & Latch-Regeln:
+	• Schalter 3 (Absolute Dunkelheit): Wird dieser Schalter aktiviert, fällt das Relais für die rote externe Raumbeleuchtung ab (Licht geht aus). Gleichzeitig werden die Displays (Nextion/LCD) auf 0% gedimmt. Root Cause: Verhindert, dass rotes Streulicht aus dem Raum oder vom Display den TSL2591-Sensor während der Spotmessung verfälscht oder das Papier bei extrem langen Belichtungszeiten verschleiert.
+	• Schalter 2 (Safelight) Priorität: Schalter 2 hat absolute Priorität über den Focus. Wird Schalter 2 eingeschaltet, wird der Focus (falls aktiv) sofort hart abgeschaltet.
+	• Focus-Sperre: Solange Schalter 2 aktiv ist, ist Schalter 1 (Focus) elektronisch tot/gesperrt.
+	• Der Safety-Latch (Anti-Flashback): Wird Schalter 2 (Safelight) ausgeschaltet, während Schalter 1 (Focus) physisch noch auf der "AN"-Position steht, bleibt das System komplett dunkel. Das Fokuslicht geht nicht automatisch wieder an.
+	• Latch-Reset: Um den Focus wieder zu aktivieren, muss der Nutzer Schalter 1 bewusst einmal auf AUS und dann wieder auf AN schalten. Dies erzwingt eine bewusste Handlung und verhindert versehentliche Lichtblitze (Fogging) beim Umschalten.
+Modus 1 bis 8
+(Spezifikation siehe Historie - BW, SG, Test Strip, Burn, Calibration, Densitometer, Setup)
+Modus 9: Handbedienteil (Wireless Probe / ESP32-C6)
+Das Handbedienteil ist das hochpräzise Auge und die Fernbedienung des Systems. Root Cause Architektur: Das Handgerät ist ein "Dumb Terminal". Es hält keinen eigenen Status, berechnet keine Mathematik und kennt keine Papier-Profile. Es liest lediglich Taster aus, sendet die Events an den ESP32-S3 und zeichnet auf dem OLED exakt das, was der S3 ihm im Antwort-Paket befiehlt. Dies verhindert Status-Asynchronität (System-Dissoziation).
+9.1 Hardware-Layout & Muskelgedächtnis
+Das Layout ist asymmetrisch für eine ergonomische Zweihand-Bedienung auf dem Grundbrett optimiert. Die linke Hand (Daumen) bedient die zwei dedizierten Kurzhubtaster, um ein Verrutschen des Geräts bei kritischen Aktionen zu verhindern.
+	• Top: TSL2591 Sensor-Auge (zeigt zum Licht).
+	• Mitte: OLED 128x64 Display.
+	• Unten Links: Zwei Taster vertikal angeordnet (Taster 1 = Oben, Taster 2 = Unten).
+	• Unten Rechts: Großer Encoder mit Push-Button.
+Die eiserne Logik-Regel zur Fehlervermeidung: Der Push-Button des Encoders ist berüchtigt für "Scroll-Slips" (versehentliches Drehen beim Drücken). Daher wird er niemals für positions- oder zeitkritische Aktionen wie "Spot messen" verwendet.
+Bedienelement	Die eiserne Logik-Regel	Beispiel-Aktion
+Taster 2 (Unten Links)	AKTION / MESSEN / FEUER	Den TSL-Sensor triggern, Belichtung starten. Die häufigste Aktion. Erzeugt kein Drehmoment am Gehäuse.
+Taster 1 (Oben Links)	UNDO / ZURÜCK / REFERENZ	Letzten Mess-Spot löschen, Mess-Modus abbrechen, Referenz speichern.
+Encoder Drehen	NAVIGATION	Modus wechseln (Soft/Hard), durch Spot-Array blättern.
+Encoder Klick	ENTER / ABSCHLIESSEN	Eine Mess-Session final bestätigen und ins Hauptsystem (S3) übernehmen. Nur genutzt, wenn das Gerät nicht mehr präzise auf dem Punkt gehalten werden muss.
+9.2 Der kongruente Workflow je Modus
+Das Verhalten des Handgeräts ändert sich dynamisch, je nachdem in welchem Modus sich das Hauptgerät (S3) gerade befindet.
+A) Mess-Modus (BW & Splitgrade - Zonen-Messung)
+	• Status: S3 ist im Idle, Nutzer will Lichter/Schatten einmessen.
+	• Taster 2 (Messen): Startet den spektralen Mess-Handshake (Grün/Blau). Der gemessene Spot wird im Histogramm als Balken ergänzt. Gerät bleibt durch reinen Daumendruck perfekt stabil auf dem Messpunkt liegen!
+	• Taster 1 (Undo): Löscht den zuletzt gemessenen Spot (falls der Sensor doch auf Staub lag).
+	• Encoder Drehen: Wechselt im SG-Modus den Fokus zwischen [ Soft Lichter ] und [ Hard Schatten ], ohne das Hauptgerät berühren zu müssen.
+	• Encoder Klick (Abschließen): Du nimmst das Gerät vom Bild, klickst den Encoder. Die Mess-Session wird abgeschlossen und die Werte (Zieldosis) gehen fest in den Haupt-Timer.
+B) Burn-Modus (Nachbelichten Remote)
+	• Status: Basisbelichtung ist fertig, S3 steht auf "Burn Armed". User positioniert Abwedel-Pappe.
+	• OLED zeigt: [ BURN 1 ], die berechnete Zeit und Gradation.
+	• Taster 2 (Feuer): Fungiert als Fernauslöser. Startet genau diesen einen Burn-Step am S3. Absolut blind mit der linken Hand erreichbar, während beide Hände die Pappe halten.
+	• Taster 1 (Abbruch): Bricht den laufenden Burn ab.
+	• Encoder Drehen: Blättert durch die programmierten Burn-Steps (Burn 2, Burn 3...).
+C) Kalibrierungs-Modus (Modus 5 - Stouffer)
+	• Status: S3 im Setup bei "Referenzlicht messen".
+	• OLED zeigt: [ CALIBRATE ] - Measure Base.
+	• Taster 2 (Messen): Triggert die Messung von $Lux_{G0}$ und $Lux_{G5}$ ohne Negativ.
+D) Densitometer-Modus (Modus 7)
+	• Status: S3 im Densitometer-Modus.
+	• OLED zeigt: [ DENSITOMETER ].
+	• Taster 1 (Referenz): Leere Bühne. Speichert das Leerlicht als Referenz ($Lux_{Ref}$). Da dies nur selten passiert, liegt es auf dem oberen Knopf.
+	• Taster 2 (Messen): Du legst das Negativ ein. Ein Klick misst den Punkt durch den Film. Das OLED zeigt sofort die optische Dichte $D$ an.
+Modus 10: ESP-NOW Kommunikation & Synchronisation
+Um Fehlbelichtungen und verfälschte Messwerte auszuschließen, nutzt das System ein deterministisches Handshake-Protokoll, gepaart mit einer strikten "Fire-and-Forget" UI-Aktualisierung.
+10.1 Das Protokoll (Single Source of Truth)
+Paket Typ A: C6 (Handgerät) an S3 (Basis) -> Der Event-Trigger Das Handgerät sendet ausschließlich Rohdaten und Hardware-Events.
+	• uint8_t magic = 0xD4;
+	• uint8_t event_type; (z.B. EVT_T2_CLICK, EVT_T1_CLICK, EVT_ENC_CLICK, EVT_ENC_UP, EVT_ENC_DOWN)
+	• float lux_raw_g0; (Nur befüllt, wenn S3 dies aktiv anfordert)
+	• float lux_raw_g5; (Nur befüllt, wenn S3 dies aktiv anfordert)
+Paket Typ B: S3 (Basis) an C6 (Handgerät) -> Der Render-Befehl Der S3 empfängt das Event, verarbeitet es in seiner State-Machine und sendet exakt zurück, was auf dem OLED stehen soll.
+	• uint8_t magic = 0xD4;
+	• char header_text[16]; (z.B. "[ BW METERING ]" oder "[ BURN 1 ARMED ]")
+	• char line1_text[16]; (z.B. "Time: 14.5s")
+	• char line2_text[16]; (z.B. "Grade: 2.5")
+	• uint8_t zone_histogram[11]; (Werte 0-255 für die Balkenhöhe der Zonen 0-X)
+	• uint8_t haptic_feedback; (0 = Aus, 1 = Kurzer Klick, 2 = Langer Fehler-Brummer)
+10.2 Der "Flash-Handshake" (Spektralmessung)
+Wenn der C6 ein EVT_T2_CLICK sendet und der S3 sich im Mess-Modus befindet, erzwingt der S3 die spektrale Sequenz, bevor er das OLED aktualisiert:
+	1. Trigger (C6): Sendet T2 Klick-Event.
+	2. Lock (S3): S3 schaltet Fokuslicht/Safelight AUS.
+	3. Phase Grün: S3 schaltet G0 (Grün) auf 100%. Wartet 100ms. S3 funkt CMD_MEASURE_G0 an C6. C6 misst und funkt Wert zurück.
+	4. Phase Blau: S3 schaltet G5 (Blau) auf 100%. Wartet 100ms. S3 funkt CMD_MEASURE_G5 an C6. C6 misst und funkt Wert zurück.
+	5. Release & Render (S3): S3 schaltet Licht zurück in Ausgangszustand, berechnet die Dosis, aktualisiert sein internes Histogramm und funkt das fertige Render-Paket B (inkl. Haptic Feedback = 1) an den C6.
+Ausgabe (C6): Der C6 zeichnet das neue Bild und lässt den Vibrationsm
 
+Historie Vorgänger / Ergänzung
 
-0 Main -> Start-Seite
-Nextion Editor 				-> ESP32
-btMNU Dualstate  id8  pic 25 pic2 9 	-> Menü
-btSW Dualstate   id1 pic 15 pic2 1 	-> Schwarz Weiß Modus BW
-btSG Dualstate   id2 pic 19 pic2 2	-> Splitgrade Modus SG
-btDENS Dualstate id3 pic 23 pic2 7	-> Densitometer Modus
-btSTR Taster	 id5 pic 27 pic2 12	-> * Taste Enter/Bestätigen
-btSL Dualstate   id7 pic 28 pic2 13 	-> Savelight Neopixel rot, Priorität Funktion wie Schalter PIN 21, zeigt Status Schalter 21
-btFOC Dualstate  id6 pic 29 pic2 14	-> Focus Licht (Neopixel weiß), Funktion wie Schalter PIN 14, zeigt Status Schalter 14
-btSCR Dualstate id9 pic 24 pic2 8 	-> LCD Beleuchtung aus, Neopixel aus, Funktion wie Schalter PIN 13, zeigt Status Schalter 13
-btHSH Taster id4 pic 17 pic2 10		-> kurz drücken Zurück / lang drücken Einstellung zurücksetzen
-
-
-tTempA id11				-> Anzeige Temperatur Alu/LED
-tPow id14				-> Anzeige Leistung Neopixel in 0 von 255
-tTempR id16 				-> Anzeige Raumtemperatur BMP280 an I2C slow
+Dukatimer UI & Hardware Architektur
+Dieses Dokument definiert die strikte Trennung von Input-Handling, Modus-Logik und mathematischer Verarbeitung, um eine konsistente "Blindbedienung" in der Dunkelkammer zu gewährleisten.
+Die physikalische Grundarchitektur (Root Cause Engine)
+Um Logikfehler bei Papierwechseln, Teststreifen und mechanischen Änderungen am Vergrößerer an der Wurzel (Root Cause) auszuschließen, arbeitet das System intern nicht mit abstrakten Zeiten (Sekunden) und Gradationen, sondern ausschließlich mit physikalischen Einheiten:
+	1. Zieldosis (Lux-Sekunden): Die absolute Lichtmenge, die das Papier benötigt.
+	2. Spektrales Verhältnis (Grün/Blau): Definiert den Kontrast (und beeinflusst die Papiereffizienz).
+Die auf dem Display angezeigten Sekunden und Gradationswerte (0.0 - 5.0) sind reine UI-Repräsentationen. Das Drehen am Zeit-Encoder verschiebt intern die Zieldosis. Das Drehen am Gradations-Encoder verschiebt intern das G/B-Verhältnis.
+Allgemeine Hardware-Philosophie & Ausführungsregeln
+	• Encoder 1 (Links): Zuständig für Zieldosis (UI-Repräsentation: Zeit/EV) und Messung.
+	• Encoder 2 (Mitte): Zuständig für Dosis-Feintuning (UI-Repräsentation: +/- Sekunden) und Bestätigung (* / ENTER).
+	• Encoder 3 (Rechts): Zuständig für Spektral-Verhältnis (UI-Repräsentation: Kontrast/Grade) und Abbruch (# / BACK).
+	• Regel 1 (Akustisches Metronom): Während jeder Belichtungsphase (Base, Test Strip, Burn) läuft zwingend ein leises, akustisches Ticken im Sekunden- oder Halbsenkundentakt mit. Dies ist das primäre Feedback für den Nutzer, dass das System arbeitet (Heartbeat).
+Physische Schalter & Safety Latch Logik (Root Cause Protection)
+Um unbeabsichtigtes Verschleiern von Fotopapier (Fogging) und verfälschte Sensorwerte auszuschließen, nutzt das System 3 dedizierte Kippschalter. Die Logik basiert zwingend auf Flankenauswertung (Edge-Detection), nicht auf reiner Level-Abfrage.
+	1. Schalter 1 (Focus): Weißlicht des Vergrößerers zum Einrichten und Fokussieren.
+	2. Schalter 2 (Safelight): Integrierte rote Sicherheitsbeleuchtung (z.B. rote LEDs am Vergrößerer-Kopf).
+	3. Schalter 3 (Mess-Dunkelheit / Relais): Steuert die externe rote Raumbeleuchtung der Dunkelkammer und die Displays.
+Die Interlock- & Latch-Regeln:
+	• Schalter 3 (Absolute Dunkelheit): Wird dieser Schalter aktiviert, fällt das Relais für die rote externe Raumbeleuchtung ab (Licht geht aus). Gleichzeitig werden die Displays (Nextion/LCD) auf 0% gedimmt. Root Cause: Verhindert, dass rotes Streulicht aus dem Raum oder vom Display den TSL2591-Sensor während der Spotmessung verfälscht oder das Papier bei extrem langen Belichtungszeiten verschleiert.
+	• Schalter 2 (Safelight) Priorität: Schalter 2 hat absolute Priorität über den Focus. Wird Schalter 2 eingeschaltet, wird der Focus (falls aktiv) sofort hart abgeschaltet.
+	• Focus-Sperre: Solange Schalter 2 aktiv ist, ist Schalter 1 (Focus) elektronisch tot/gesperrt.
+	• Der Safety-Latch (Anti-Flashback): Wird Schalter 2 (Safelight) ausgeschaltet, während Schalter 1 (Focus) physisch noch auf der "AN"-Position steht, bleibt das System komplett dunkel. Das Fokuslicht geht nicht automatisch wieder an.
+	• Latch-Reset: Um den Focus wieder zu aktivieren, muss der Nutzer Schalter 1 bewusst einmal auf AUS und dann wieder auf AN schalten. Dies erzwingt eine bewusste Handlung und verhindert versehentliche Lichtblitze (Fogging) beim Umschalten.
+Modus 1: BW-Modus (Black & White / Mischlicht)
+Hardware-Belegung (BW)
+Bedienelement	Aktion (UI-Sicht)	Interne Verarbeitung (Physik)
+Encoder 1 (Links)	Zeit ändern (EV)	Skaliert die berechnete Zieldosis logarithmisch.
+Enc 1 Taster (Kurz)	EV-Step umschalten	Ändert den Multiplikator für Enc 1.
+Enc 1 Taster (Lang)	Spot-Messung starten	Löst die spektrale Mess-Sequenz aus. Berechnet Zieldosis.
+Encoder 2 (Mitte)	Zeit ändern (Linear)	Addiert/Subtrahiert einen fixen Lux-Sekunden-Wert zur Zieldosis.
+Enc 2 Taster (Kurz)	ENTER / Bestätigen (*)	Zentraler Bestätigungs-Taster.
+Encoder 3 (Rechts)	Gradation ändern	Ändert das Grün/Blau-Verhältnis.
+Enc 3 Taster (Kurz)	BACK / Abbruch (#)	Bricht aktive Aktionen ab und kehrt zu BW-Idle zurück.
+Enc 3 Taster (Lang)	Reset Time & Grade	Setzt Zieldosis und Spektral-Verhältnis auf Papier-Standard zurück.
+Start-Taster	Start / Stopp	Startet die Belichtung (bevorzugt im Closed-Loop Dose-Mode).
+Modus 2: Splitgrade-Modus (SG)
+Hardware-Belegung (SG)
+Bedienelement	Aktion (UI-Sicht)	Interne Verarbeitung (Physik)
+Encoder 1 (Links)	Soft-Zeit ändern (EV)	Skaliert die berechnete Dosis_Soft (Grünkanal) logarithmisch.
+Enc 1 Taster (Kurz)	EV-Step umschalten	Ändert den Multiplikator (1/1 bis 1/6) für alle Encoder.
+Enc 1 Taster (Lang)	Start Soft-Session	Startet den Sammel-Modus für Lichter-Messpunkte (Averaging).
+Encoder 2 (Mitte)	Hard-Zeit ändern (EV)	Skaliert die berechnete Dosis_Hard (Blaukanal) logarithmisch.
+Enc 2 Taster (Kurz)	ENTER / Bestätigen (*)	Zentraler Bestätigungs-Taster (Schließt auch Mess-Sessions ab).
+Enc 2 Taster (Lang)	Start Hard-Session	Startet den Sammel-Modus für Schatten-Messpunkte (Averaging).
+Encoder 3 (Rechts)	Master Helligkeit (Shift)	Geheimwaffe: Verschiebt Dosis_Soft UND Dosis_Hard proportional. Der Bildkontrast bleibt identisch, das Bild wird insgesamt heller/dunkler.
+Enc 3 Taster (Kurz)	BACK / Abbruch (#)	Bricht aktive Aktionen ab (z.B. laufende Session verwerfen).
+Enc 3 Taster (Lang)	Reset Dosen	Setzt Dosis_Soft und Dosis_Hard auf Standardwerte zurück.
+Start-Taster	Start / Stopp	Führt sequenzielle Belichtung aus (Erst Soft, dann Hard).
+Modus 3: Probestreifen-Modus (Test Strip)
+Der Teststreifen ist ein temporäres UI-Overlay. Er generiert ausschließlich Belichtungsreihen (Dosis-Sequenzen). Der Modus erzwingt einen "Closed Loop": Das Ergebnis der Sichtprüfung wird direkt als neue System-Basis übernommen.
+Phase 1: Setup (Konfiguration)
+Aufruf erfolgt über das Nextion-Display. Das System pausiert den Haupt-Timer.
+Bedienelement	Aktion	Logik / Erklärung
+Encoder 1 (Links)	EV-Step wählen	Schrittweite zwischen den Streifen (z.B. 1/6, 1/3, 1/2 EV).
+Encoder 2 (Mitte)	Anzahl Streifen	Wählt die Anzahl der Teilbelichtungen (z.B. 3, 5, 7). Basis-Dosis ist exakt die Mitte.
+Enc 2 Taster (Kurz)	Bestätigen (*)	Loggt die Parameter ein und wechselt in Phase 2.
+Enc 3 Taster (Kurz)	Abbruch (#)	Verlässt den Modus.
+Phase 2: Execution (Belichtungs-Ablauf)
+Das System berechnet die Delta-Dosen für jeden inkrementellen Schritt. Das 16x2 LCD zeigt den Fortschritt grafisch an (Format XXO̲OO). Der Hardware-Cursor unterstreicht den anstehenden Streifen.
+Bedienelement	Aktion	Logik / Erklärung
+Start-Taster	Nächster Strip	Startet die nächste inkrementelle Belichtung. Piepton am Ende.
+Enc 3 Taster (Kurz)	Abbruch (#)	Bricht die laufende Serie ab (Not-Aus).
+Phase 3: Evaluation (Auswertung & Rückführung)
+Nach der Entwicklung geht das System in den Auswahl-Modus.
+Bedienelement	Aktion	Logik / Erklärung
+Encoder 1 oder 2	Cursor verschieben	Bewegt den Cursor (_) über die Streifen-Grafik. Zeile 2 zeigt korrespondierende Zeit.
+Enc 2 Taster (Kurz)	Auswahl (*)	Closed Loop: Die Dosis des gewählten Streifens überschreibt die Zieldosis des Haupt-Modus.
+Enc 3 Taster (Kurz)	Verwerfen (#)	Overlay schließt sich ohne Änderung.
+Modus 4: Burn-Modus (Nachbelichten On-Demand)
+Der Burn-Modus ist ein eigenständiger Ausführungs-Status (Overlay). Er wird explizit nach der Basis-Belichtung aufgerufen.
+Hardware-Belegung (Burn-Setup & Execution)
+Aufruf über Nextion. Das LCD wechselt in die Burn-Ansicht. Die 100%-Referenz ist die zuletzt genutzte Basis-Zieldosis.
+Bedienelement	Aktion (UI-Sicht)	Interne Verarbeitung (Physik)
+Encoder 1 (Links)	Burn-Menge (EV)	Definiert die Zusatz-Dosis (+1/6, +1/3 EV etc.) relativ zur Basis. LCD zeigt errechnete absolute Sekunden.
+Enc 1 Taster (Kurz)	EV-Step umschalten	Ändert die Schrittweite des Encoders.
+Encoder 3 (Rechts)	Burn-Gradation	Ändert das G/B-Verhältnis für diese spezifische Nachbelichtung.
+Enc 3 Taster (Kurz)	Zurück (#)	Verlässt den Burn-Modus.
+Start-Taster	Burn Ausführen	Führt genau diese eine Nachbelichtung aus (Metronom tickt).
+Modus 5: Papier-Kalibrierung & Zonen-Matrix (PaperBank)
+Die Kalibrierung generiert die physikalischen Dosis-Eckpunkte des Papiers ($D_{min}$ und $D_{max}$ für G0 und G5). Um Hardware-Fehler (LED-Latenz) und chemische Fehler (Schwarzschild-Effekt / Reziprozität) vollständig zu eliminieren, basiert der Workflow zwingend auf einem Stouffer T2115 Transmissions-Graukeil (21 Stufen, $\Delta D = 0.15 = 1/2$ EV pro Stufe).
+Der Stouffer-Workflow (Nextion)
+	1. Referenz-Messung: Die Spot-Probe misst das ungedämpfte Grundlicht auf dem Grundbrett für reines Grün ($Lux_{G0}$) und reines Blau ($Lux_{G5}$).
+	2. Kontaktkopie (1-Shot): Der Stouffer-Keil wird auf das Testpapier gelegt. Der Timer feuert eine einzige Referenz-Belichtung (z.B. exakt 10 Sekunden) pro Kanal. Das System speichert diese Basis-Dosis ($Dosis_{Ref} = Lux \times 10s$).
+	3. Auswertung (Visuell): Nach der Entwicklung sucht der Nutzer auf dem Papier die relevanten Stufen. Er gibt am Nextion ein:
+		○ "Grün: Erstes reines Weiß (Zone VIII) = Stufe 4"
+		○ "Grün: Erstes tiefes Schwarz (Zone I) = Stufe 16" (Wiederholung für den Blau-Kanal)
+	4. Physikalische Berechnung: Der S3 rechnet die Stufen über die Transmissionsformel rückwärts in absolute Dosen um: $Dosis_{Eckpunkt} = Dosis_{Ref} \times 10^{-0.15 \times (\text{Stufe} - 1)}$. Das Papier ist damit mit nur zwei Testblättern und mathematisch absoluter Präzision vollständig in der PaperBank parametrisiert (ISO-P, ISO-R, Zonen-Spreizung).
+Modus 6: Zonen-System & ESP-NOW Architektur
+Das Handgerät (Wireless Probe) fungiert als abgesetztes UI für den S3.
+ESP-NOW Datenpaket-Struktur (Closed Loop)
+Sender (Probe) -> Empfänger (S3): MagicByte (0xD4), Lux_Soft, Lux_Hard, Button_Event Empfänger (S3) -> Sender (Probe): Zone_Array[11], Target_Grade, Target_Time
+UI auf dem OLED der Probe (Sender)
+Das 128x64 Display nutzt U8g2 für eine puristische Zonen-Darstellung:
+	• Oben: Anzeige der berechneten Zeit und empfohlenen Gradation.
+	• Unten: Balkengrafik (Histogramm) mit 11 "Buckets" (Zone 0 bis X).
+Detail-UI auf dem Nextion (S3)
+Visualisiert die hochauflösende Charakteristische Kurve des Papiers und zeigt, wo die Messpunkte auf der tatsächlichen Schwärzungskurve liegen.
+Modus 7: Densitometer-Modus (Film-Optimierung & Sensor-Kalibrierung)
+Dieser Modus schließt den Kreis zwischen Sensor-Präzision, Film-Entwicklung und Papier-Belichtung.
+Workflow & Logik
+	1. Referenz: Messung der Lichtquelle ohne Film ($Lux_{Ref}$).
+	2. Messung: Messung durch das Negativ ($Lux_{Meas}$).
+	3. Berechnung: $D = \log_{10}(Lux_{Ref} / Lux_{Meas})$.
+Verwendungszwecke
+	• Zweck A (Sensor-Linearisierung): Dies ist der erste Schritt beim System-Setup. Der Stouffer T2115 Keil wird ausgemessen. Da die echten Dichtewerte des Keils bekannt sind (Stufe $\times$ 0.15), wird eine Linearisierungs-Kurve für den TSL2591-Sensor im System hinterlegt. Das macht die Spot-Probe so präzise wie ein professionelles Labor-Densitometer.
+	• Zweck B (Papier-Matching): Messung von Lichtern und Schatten eines Negativs. Das System errechnet den Dichteumfang ($\Delta D$) und schlägt aus der PaperBank die exakt passende Gradation vor.
+	• Zweck C (Film-Testing & Export): Ausmessen von Filmentwicklungs-Testreihen zur Bestimmung von Film-ISO und Entwicklungszeit (N-1, N, N+1). Export der CSV-Daten via Nextion/USB.
+Modus 8: System Setup & Konfiguration (Nextion)
+Um kognitive Überlastung zu vermeiden, nutzt das Setup eine strikt flache Hierarchie (max. 2 Ebenen: Kategorie -> Parameter). Die primäre Steuerung erfolgt über die Hardware-Encoder (Fokus auf Blindbedienung/nasse Hände). Touch-Eingaben auf dem Nextion fungieren lediglich als parallel funktionierendes Fallback.
+Die State-Machine des Menüs (Navigieren vs. Editieren)
+Um Fehlbedienungen auszuschließen, gibt es zwei harte Zustände im Menü:
+	1. Navigations-State: Encoder 1 bewegt einen Auswahl-Cursor (Highlighter) durch die Parameter-Liste. Die Werte selbst bleiben geschützt.
+	2. Edit-State: Wird ein Parameter per ENTER angewählt, fängt sein Wert an zu blinken (oder wird rot). Encoder 1 ist jetzt vom Cursor entkoppelt und ändert ausschließlich den Wert.
+Psychologische Sicherheit: Encoder 3 (BACK) fungiert als absolute "Panik-Taste". Egal in welchem Status man sich befindet, ein Druck bricht das Editieren ab oder springt eine Ebene nach oben.
+Encoder-Mapping (Setup)
+Bedienelement	Aktion im NAVIGATIONS-State	Aktion im EDIT-State (Wert blinkt)
+Encoder 1 (Links)	Cursor hoch/runter (Listen scrollen).	Wert erhöhen / verringern.
+Encoder 2 (Mitte)	(Gesperrt)	(Gesperrt)
+Enc 2 Taster (Kurz)	ENTER: Wechselt in den EDIT-State.	SAVE: Übernimmt den neuen Wert und kehrt in den Navigations-State zurück.
+Encoder 3 (Rechts)	(Gesperrt)	(Gesperrt)
+Enc 3 Taster (Kurz)	BACK: Setup-Menü verlassen (Abfrage: Speichern?).	ESCAPE: Änderung verwerfen, alten Wert wiederherstellen, zurück in Navigations-State.
+Der Funktionsumfang (Kategorien & Parameter)
+Das Menü ist in logische System-Kategorien (Reiter) unterteilt:
+	1. Beleuchtung & Dimming
+		○ Safelight Max PWM: Helligkeit der roten NeoPixel (0-100%).
+		○ Focus Max PWM: Helligkeit der weißen LEDs beim Einrichten (0-100%).
+		○ Display Brightness: Helligkeit des Nextion und LCD im Normalbetrieb.
+		○ Dimming Time: Weiche Überblend-Zeit für LEDs (in Millisekunden).
+	2. Audio & Feedback
+		○ Beep Volume: Lautstärke des Buzzers (0-100%).
+		○ Metronome: Ticken während Belichtung an/aus.
+		○ Click-Feedback: Tasten-Klick an/aus.
+	3. Hardware & Regelung
+		○ Dose-Mode: Closed-Loop Regelung aktivieren (Nutzt Sensor im Kopf) / deaktivieren (klassischer Sekunden-Timer).
+		○ Relais Delay: Verzögerungszeit für das Abfallen des Raumlicht-Relais nach Belichtungsende (in Sekunden, verhindert Flackern).
+	4. PaperBank Management (Profil-Editor)
+		○ Active Paper: Auswahl des aktiven Papiers für die aktuellen Berechnungen.
+		○ Edit ISO Speed: Ermöglicht einen globalen ISO-Shift (z.B. -1/3 EV) für ein bestehendes Profil, um erschöpften Entwickler auszugleichen, ohne neu mit dem Stouffer-Keil messen zu müssen. Interne Logik: Der S3 skaliert alle 4 Dosis-Eckpunkte des Profils proportional.
+		○ Manual Datasheet Entry: Erlaubt das manuelle Eintippen von ISO-P (Speed) und ISO-R (Range) Werten für G0 und G5 aus einem Datenblatt. Interne Logik: Der S3 rechnet die Norm-Werte rückwärts in absolute Dosis-Eckpunkte um und speichert sie ab.
+		○ Delete Profile: Löscht einen gespeicherten Parametersatz aus dem PSRAM/EEPROM.
+	5. System
+		○ Factory Reset: Setzt alle Variablen und die PaperBank auf Null/Werkseinstellung.
+Save & Exit: Sichert Struct ins NVS und beendet das Setup.

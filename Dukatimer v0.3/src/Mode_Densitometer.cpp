@@ -16,11 +16,11 @@ extern void PaintLED(int r, int g, int b);
 extern void beepOk();
 extern void beepValue();
 extern void beepWarnLong();
-extern double takeAveragedLux(uint8_t samples, uint16_t delayMs);
 
 // Helper
 static Mode prevMode = MODE_SG;
 static unsigned long densMsgUntil = 0;
+static bool densMeasBusy = false;  // Async Messung laeuft
 
 void enterDensMode() {
   prevMode = currentMode;
@@ -44,6 +44,39 @@ void exitDensMode() {
 }
 
 void runDensitometerLoop(char key) {
+  // --- Async-Messung ticken (non-blocking) ---
+  if (densMeasBusy) {
+    if (tickAsyncSpot()) {
+      densMeasBusy = false;
+      double avg = getAsyncSpotResult();
+      isMeasuring = false;
+      handleLights();
+      if (avg > 0.1) {
+         densRefLux = avg;
+         densState = DENS_IDLE;
+         beepOk();
+         smartLCD("REF SAVED", String(densRefLux, 2) + " lx");
+         densMsgUntil = millis() + 1000;
+      } else {
+         beepWarnLong();
+         smartLCD("TOO DARK", "Light on?");
+         densMsgUntil = millis() + 800;
+      }
+    }
+    // Waehrend Messung nur Abort erlauben
+    if (key == '*') {
+      cancelAsyncSpot();
+      densMeasBusy = false;
+      densState = DENS_IDLE;
+      isMeasuring = false;
+      handleLights();
+      updateNextionUI(true);
+      beepWarnLong();
+      lcd.clear();
+    }
+    return;
+  }
+
   // Navigation
   if (key == '*') {
       if (densState == DENS_IDLE) { exitDensMode(); return; }
@@ -117,20 +150,15 @@ void runDensitometerLoop(char key) {
          handleLights();
          lcd.setRGB(0, 0, 0);
          updateNextionUI(true);
-         double avg = takeAveragedLux(10, 50);
-         isMeasuring = false;
-         handleLights();
-          if (avg > 0.1) {
-             densRefLux = avg;
-             densState = DENS_IDLE;
-             beepOk();
-             smartLCD("REF SAVED", String(densRefLux, 2) + " lx");
-             densMsgUntil = millis() + 1000;
-          } else {
-             beepWarnLong();
-             smartLCD("TOO DARK", "Light on?");
-             densMsgUntil = millis() + 800;
-          }
+         if (startAsyncSpot(10, 50, 150)) {
+           densMeasBusy = true;
+         } else {
+           isMeasuring = false;
+           handleLights();
+           beepWarnLong();
+           smartLCD("BUSY", "TRY AGAIN");
+           densMsgUntil = millis() + 500;
+         }
        }
     } break;
 
@@ -181,7 +209,7 @@ void runDensitometerLoop(char key) {
             densBaseFog = D;
             beepOk();
             smartLCD("BASE FOG SET", String(densBaseFog, 2));
-            delay(800);
+            densMsgUntil = millis() + 800;
          }
        }
        

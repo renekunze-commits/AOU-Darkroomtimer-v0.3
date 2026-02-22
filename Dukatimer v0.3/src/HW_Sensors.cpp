@@ -26,23 +26,29 @@ SpotMeas readSpot() {
   // =============================================================================
   // WEICHE: WIRELESS ODER KABEL
   // =============================================================================
-  if (useWirelessProbe) {
-      // Modus: Drahtloser Sensor
+    if (useWirelessProbe) {
+      extern portMUX_TYPE luxMux;
+      double currentLux;
+      unsigned long currentMs;
+      portENTER_CRITICAL(&luxMux);
+      currentLux = remoteLux;
+      currentMs = lastRemotePacketMs;
+      portEXIT_CRITICAL(&luxMux);
       // Prüfe ob Daten frisch sind (jünger als 2 Sekunden)
-      if (millis() - lastRemotePacketMs < 2000) {
-          m.lux = remoteLux;
-          m.ok = true;
-          // Wireless sendet keine Raw Channels, daher 0
-          m.ch0 = 0; 
-          m.ch1 = 0;
+      if (millis() - currentMs < 2000) {
+        m.lux = currentLux;
+        m.ok = true;
+        // Wireless sendet keine Raw Channels, daher 0
+        m.ch0 = 0; 
+        m.ch1 = 0;
       } else {
-          // Timeout! Sensor hat Verbindung verloren
-          m.lux = 0.0;
-          m.ok = false; 
-          // Tipp: Hier könnte man später im UI "NO SIGNAL" anzeigen
+        // Timeout! Sensor hat Verbindung verloren
+        m.lux = 0.0;
+        m.ok = false; 
+        // Tipp: Hier könnte man später im UI "NO SIGNAL" anzeigen
       }
       return m; // Hier raus, wir ignorieren den lokalen Sensor
-  }
+    }
   
   // =============================================================================
   // FALLBACK: LOKALER SENSOR (TSL2591 über Kabel)
@@ -110,4 +116,92 @@ double takeAveragedLux(uint8_t samples, uint16_t delayMs) {
   }
   if (n == 0) return NAN;
   return acc / (double)n;
+}
+
+// =============================================================================
+// ASYNC SPOT MEASUREMENT (Non-Blocking)
+// =============================================================================
+// Ersetzt den blockierenden takeAveragedLux() Aufruf durch eine State Machine,
+// die pro loop()-Durchlauf maximal eine I2C-Abfrage (~2ms) macht.
+// Ablauf: IDLE → SETTLE (LED-Abklingzeit) → SAMPLING (N Messungen) → DONE
+//
+// Warum non-blocking?
+//   takeAveragedLux(7, 110) blockiert 770ms. Währenddessen:
+//   - UI (Nextion/LCD) friert ein
+//   - Metronom stottert
+//   - ESP-NOW Pakete gehen verloren (Pufferüberlauf)
+//   Die async Version gibt nach jeder Einzelmessung (~2ms I2C) die
+//   Kontrolle an den Main Loop zurück.
+// =============================================================================
+
+enum SpotPhase : uint8_t { SPOT_IDLE = 0, SPOT_SETTLE, SPOT_SAMPLING, SPOT_DONE };
+static SpotPhase     spotPhase    = SPOT_IDLE;
+static uint8_t       spotTarget   = 0;
+static uint8_t       spotTaken    = 0;
+static uint8_t       spotOk       = 0;
+static uint16_t      spotInterval = 100;
+static double        spotAccum    = 0.0;
+static unsigned long spotNextMs   = 0;
+static double        spotResult   = NAN;
+
+bool startAsyncSpot(uint8_t samples, uint16_t intervalMs, uint16_t settleMs) {
+    if (spotPhase == SPOT_SETTLE || spotPhase == SPOT_SAMPLING) return false;
+    spotTarget   = samples;
+    spotInterval = intervalMs;
+    spotTaken    = 0;
+    spotOk       = 0;
+    spotAccum    = 0.0;
+    spotResult   = NAN;
+    spotNextMs   = millis() + settleMs;
+    spotPhase    = SPOT_SETTLE;
+    return true;
+}
+
+bool tickAsyncSpot() {
+    if (spotPhase == SPOT_IDLE) return false;
+    if (spotPhase == SPOT_DONE) return true;
+
+    unsigned long now = millis();
+
+    if (spotPhase == SPOT_SETTLE) {
+        if (now >= spotNextMs) {
+            spotPhase  = SPOT_SAMPLING;
+            spotNextMs = now; // Erste Messung sofort
+        }
+        return false;
+    }
+
+    // SPOT_SAMPLING
+    if (now >= spotNextMs) {
+        wdt_reset();
+        SpotMeas sm = readSpot();
+        if (sm.ok && isfinite(sm.lux) && sm.lux > 0.0) {
+            spotAccum += sm.lux;
+            spotOk++;
+        }
+        spotTaken++;
+        if (spotTaken >= spotTarget) {
+            spotResult = (spotOk > 0) ? (spotAccum / (double)spotOk) : NAN;
+            spotPhase  = SPOT_DONE;
+            return true;
+        }
+        spotNextMs = now + spotInterval;
+    }
+    return false;
+}
+
+double getAsyncSpotResult() {
+    double r = spotResult;
+    spotPhase  = SPOT_IDLE;
+    spotResult = NAN;
+    return r;
+}
+
+bool isAsyncSpotBusy() {
+    return (spotPhase == SPOT_SETTLE || spotPhase == SPOT_SAMPLING);
+}
+
+void cancelAsyncSpot() {
+    spotPhase  = SPOT_IDLE;
+    spotResult = NAN;
 }

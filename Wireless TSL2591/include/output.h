@@ -2,8 +2,9 @@
 #define OUTPUT_H
 
 #include <Arduino.h>
+#include "config.h"
 
-// Initialisiert das OLED-Display (auf dem zweiten I2C Bus) und den Buzzer
+// Initialisiert LCD Display und Buzzer
 void initOutput();
 
 // Zeigt den Startbildschirm an
@@ -12,11 +13,17 @@ void showStartup();
 // Zeigt eine Fehlermeldung auf dem Display an
 void showError(const char* msg);
 
-// Aktualisiert die Hauptanzeige mit den aktuellen Mess- und Statuswerten
-void updateDisplay(float lux, long encVal, uint32_t seq, bool txOK);
+// Rendert den vom S3 empfangenen Render-Befehl auf dem LCD
+void renderFromPacket(const ProbeRenderPacket& pkt);
 
-// Sound-Hilfsfunktionen für den Piezo-Buzzer
+// Zeigt den Standby-Bildschirm (kein aktiver Modus)
+void showStandby(float lastLux, uint32_t seq, bool txOK);
+
+// Sound-Hilfsfunktionen
 void beep(int freq, int duration);
 void clickSound();
+
+// Haptisches Feedback gemäß ProbeHaptic-Enum
+void playHaptic(uint8_t hapticCode);
 
 #endif

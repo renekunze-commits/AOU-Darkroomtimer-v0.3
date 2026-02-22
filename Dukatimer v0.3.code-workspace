@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "Dukatimer v0.3"
+		},
+		{
+			"path": "Wireless TSL2591"
 		}
 	],
 	"settings": {}

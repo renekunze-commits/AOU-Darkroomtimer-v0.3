@@ -81,7 +81,7 @@ void smartLCD(const char* l1, const char* l2) {
   if (!lcdOK) return;
 
   // --- 1. FARB-LOGIK & DUNKELKAMMER-MODUS ---
-  bool isScreenOff = (digitalRead(PIN_SW_ROOMLIGHT) == LOW) || screenOffOverride; 
+  bool isScreenOff = roomLatch || screenOffOverride; 
   char buf1[17], buf2[17];
   const char *display1 = l1, *display2 = l2;
 
@@ -128,7 +128,7 @@ void smartLCD(const String& l1, const String& l2) {
 void handleLCDBacklight() {
   if (!lcdOK) return;
 
-  bool isScreenOff = (digitalRead(PIN_SW_ROOMLIGHT) == LOW) || screenOffOverride;
+  bool isScreenOff = roomLatch || screenOffOverride;
   if (isScreenOff) {
     lcd.setRGB(0, 0, 0);
     return;
@@ -224,7 +224,7 @@ void updateNextionUI(bool force) {
   }
 
   // --- 5. BUTTONS & ICONS ---
-  bool isScreenOff = (digitalRead(PIN_SW_ROOMLIGHT) == LOW) || screenOffOverride;
+  bool isScreenOff = roomLatch || screenOffOverride;
   bool screenOffState = isScreenOff || isMeasuring;
   int valScr = screenOffState ? 1 : 0;
   

@@ -12,7 +12,6 @@ extern void beepOk();
 extern void beepWarnLong();
 extern void beepWizardStep();
 extern void beepWizardSave();
-extern double takeAveragedLux(uint8_t samples, uint16_t delayMs);
 extern char getNextionKey();
 extern void updateNextionUI(bool force);
 
@@ -21,7 +20,7 @@ extern void updateNextionUI(bool force);
 CalStep calState = CAL_IDLE;
 bool calAbort = false;
 unsigned long calMsgUntil = 0;
-static double calLastAvg = NAN;
+static bool calMeasBusy = false;  // Async Messung laeuft
 
 // --- Shortcut zum aktuellen Papierprofil ---
 PaperProfile& CAL_CURP() { return getActivePaper(); }
@@ -30,6 +29,7 @@ PaperProfile& CAL_CURP() { return getActivePaper(); }
 void startCalibrationWizard() {
     calState = CAL_START;
     calAbort = false;
+    calMeasBusy = false;
     calMsgUntil = millis() + 1000;
     smartLCD("CALIBRATE PAPER", "P" + String(getActivePaperIndex() + 1));
     PaintLED(0, 0, 0);
@@ -38,6 +38,78 @@ void startCalibrationWizard() {
 // --- Wizard Loop (zyklisch aufrufen) ---
 void runCalibrationWizard() {
     wdt_reset();
+
+    // --- Async-Messung ticken (non-blocking) ---
+    if (calMeasBusy) {
+        // Waehrend Messung nur Abort erlauben
+        char k = getNextionKey();
+        if (k == '*') calAbort = true;
+        if (calAbort) {
+            cancelAsyncSpot();
+            calMeasBusy = false;
+            isMeasuring = false;
+            handleLights();
+            calState = CAL_IDLE;
+            calAbort = false;
+            PaintLED(0, 0, 0);
+            smartLCD("CALIB ABORTED", "");
+            beepWarnLong();
+            calMsgUntil = millis() + 1000;
+            return;
+        }
+
+        if (tickAsyncSpot()) {
+            calMeasBusy = false;
+            double avg = getAsyncSpotResult();
+            isMeasuring = false;
+            handleLights();
+
+            switch (calState) {
+                case CAL_G5:
+                    if (!isnan(avg) && time_hard > 0.05) {
+                        CAL_CURP().Khard = avg * time_hard;
+                        beepWizardStep();
+                        smartLCD("Khard: " + String(CAL_CURP().Khard, 1), "OK");
+                        calMsgUntil = millis() + 800;
+                        calState = CAL_G0;
+                    } else {
+                        smartLCD("G5 FAILED", "A=RETRY *=ABT");
+                        beepWarnLong();
+                        calMsgUntil = millis() + 1000;
+                    }
+                    break;
+                case CAL_G0:
+                    if (!isnan(avg) && time_soft > 0.05) {
+                        CAL_CURP().Ksoft = avg * time_soft;
+                        beepWizardStep();
+                        smartLCD("Ksoft: " + String(CAL_CURP().Ksoft, 1), "OK");
+                        calMsgUntil = millis() + 800;
+                        calState = CAL_G25;
+                    } else {
+                        smartLCD("G0 FAILED", "A=RETRY *=ABT");
+                        beepWarnLong();
+                        calMsgUntil = millis() + 1000;
+                    }
+                    break;
+                case CAL_G25:
+                    if (!isnan(avg) && time_bw > 0.05) {
+                        CAL_CURP().Kbw = avg * time_bw;
+                        beepWizardStep();
+                        smartLCD("Kbw: " + String(CAL_CURP().Kbw, 1), "OK");
+                        calMsgUntil = millis() + 800;
+                        calState = CAL_REVIEW;
+                    } else {
+                        smartLCD("BW FAILED", "A=RETRY *=ABT");
+                        beepWarnLong();
+                        calMsgUntil = millis() + 1000;
+                    }
+                    break;
+                default: break;
+            }
+        }
+        return;
+    }
+
     char k = getNextionKey();
     bool startPressed = checkButtonPress(btnStart, PIN_START);
     bool backPressed = (k == '*');
@@ -75,20 +147,8 @@ void runCalibrationWizard() {
                 handleLights();
                 lcd.setRGB(0, 0, 0);
                 updateNextionUI(true);
-                double avg = takeAveragedLux(7, 110);
-                isMeasuring = false;
-                handleLights();
-                if (!isnan(avg) && time_hard > 0.05) {
-                    CAL_CURP().Khard = avg * time_hard;
-                    beepWizardStep();
-                    smartLCD("Khard: " + String(CAL_CURP().Khard, 1), "OK");
-                    calMsgUntil = millis() + 800;
-                    calState = CAL_G0;
-                } else {
-                    smartLCD("G5 FAILED", "A=RETRY *=ABT");
-                    beepWarnLong();
-                    calMsgUntil = millis() + 1000;
-                }
+                startAsyncSpot(7, 100, 150);
+                calMeasBusy = true;
             }
             break;
 
@@ -100,20 +160,8 @@ void runCalibrationWizard() {
                 handleLights();
                 lcd.setRGB(0, 0, 0);
                 updateNextionUI(true);
-                double avg = takeAveragedLux(7, 110);
-                isMeasuring = false;
-                handleLights();
-                if (!isnan(avg) && time_soft > 0.05) {
-                    CAL_CURP().Ksoft = avg * time_soft;
-                    beepWizardStep();
-                    smartLCD("Ksoft: " + String(CAL_CURP().Ksoft, 1), "OK");
-                    calMsgUntil = millis() + 800;
-                    calState = CAL_G25;
-                } else {
-                    smartLCD("G0 FAILED", "A=RETRY *=ABT");
-                    beepWarnLong();
-                    calMsgUntil = millis() + 1000;
-                }
+                startAsyncSpot(7, 100, 150);
+                calMeasBusy = true;
             }
             break;
 
@@ -125,20 +173,8 @@ void runCalibrationWizard() {
                 handleLights();
                 lcd.setRGB(0, 0, 0);
                 updateNextionUI(true);
-                double avg = takeAveragedLux(7, 110);
-                isMeasuring = false;
-                handleLights();
-                if (!isnan(avg) && time_bw > 0.05) {
-                    CAL_CURP().Kbw = avg * time_bw;
-                    beepWizardStep();
-                    smartLCD("Kbw: " + String(CAL_CURP().Kbw, 1), "OK");
-                    calMsgUntil = millis() + 800;
-                    calState = CAL_REVIEW;
-                } else {
-                    smartLCD("BW FAILED", "A=RETRY *=ABT");
-                    beepWarnLong();
-                    calMsgUntil = millis() + 1000;
-                }
+                startAsyncSpot(7, 100, 150);
+                calMeasBusy = true;
             }
             break;
 

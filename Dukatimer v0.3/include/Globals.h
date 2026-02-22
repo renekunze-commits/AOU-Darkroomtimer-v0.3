@@ -1,3 +1,4 @@
+extern volatile uint32_t totalDroppedPackets;
 #ifndef GLOBALS_H
 #define GLOBALS_H
 
@@ -90,6 +91,7 @@ extern int currentGainIdx;
 // Software toggles for lights
 extern bool whiteLatch;
 extern bool safeLatch;
+extern bool roomLatch;
 extern bool sgShiftModeDensity;
 
 // Tracking & UI Helper
@@ -125,6 +127,9 @@ extern bool tsActiveExposure;
 
 // Measurement
 extern MeasureMode measureMode;
+extern MeasureFocus currentMeasureFocus;
+extern MeasureState currentMeasureState;
+extern float timer_base_seconds;
 extern unsigned long measureUiSinceMs;
 extern double measSoftSum;
 extern int measSoftCount;
@@ -132,6 +137,9 @@ extern double measHardSum;
 extern int measHardCount;
 extern double measBWSum;
 extern int measBWCount;
+extern uint8_t currentZoneHistogram[11];
+extern double targetDoseSoft;
+extern double targetDoseHard;
 
 // Misc globals
 extern bool isPaused;
@@ -139,12 +147,35 @@ extern bool isMeasuring;
 extern bool setupMenuActive;
 
 // =============================================================================
-// WIRELESS SENSOR (ESP-NOW)
+// WIRELESS SENSOR (ESP-NOW Bidirektional)
 // =============================================================================
 extern bool useWirelessProbe;                    // Die Einstellung (Menu)
 extern volatile double remoteLux;                // Der letzte empfangene Wert
 extern volatile unsigned long lastRemotePacketMs; // Zeitstempel des letzten Pakets
 extern void initWireless();                      // Init Funktion
+
+// Probe Event Queue (geschrieben im Callback, gelesen im Main Loop)
+extern volatile uint8_t probeLastEvent;          // Letztes Event vom Handgerät
+extern volatile float   probeLuxG0;              // Gemessener Grün-Wert (Flash-Handshake)
+extern volatile float   probeLuxG5;              // Gemessener Blau-Wert (Flash-Handshake)
+extern volatile bool    probeEventPending;        // Neues Event wartet auf Verarbeitung
+extern volatile bool    probeConnected;           // Heartbeat empfangen (lebt noch?)
+extern bool             probeFlashActive;         // Flash-Handshake läuft (LED exklusiv)
+extern bool             measurementOverrideActive; // Messung hat direkte Lichtkontrolle
+extern volatile uint32_t probeEventOverruns;      // FIFO Überläufe (Eventverlust unter Last)
+
+// Event-FIFO API (ISR schreibt, Main Loop liest)
+extern bool popProbeEvent(uint8_t &evt, float &luxG0, float &luxG5);
+
+// Sende-Funktionen (S3 → C6)
+extern void sendProbeRender(const char* header, const char* line1, const char* line2,
+                            const uint8_t* histogram, uint8_t haptic, uint8_t mode);
+extern void sendRenderPacketToC6();
+extern void sendProbeMeasureCmd(uint8_t cmd);     // CMD_MEASURE_G0 oder CMD_MEASURE_G5
+extern void sendProbeIdle();                      // CMD_IDLE senden
+
+// Licht-Hardware API für expliziten Flash-Handshake
+extern void setLEDMode(uint8_t mode);
 
 // Task / synchronization
 extern SemaphoreHandle_t gTimerMutex;
@@ -244,6 +275,10 @@ extern void loadSettings();
 extern void startMeteringSession();
 extern bool isMeteringActive();
 extern void handleMeteringSession(bool addSpot, bool saveApply, bool toggleChannel, bool resetAll, bool cancel);
+extern bool triggerSpectralMeasurement();
+extern bool handleMeasurementStateMachine(uint8_t evt, float luxG0, float luxG5);
+extern void abortMeasurementWithError(const char* line1);
+extern void processSpotMeasurement(float luxG0, float luxG5);
 
 // Setup handler available to call from UI
 extern void handleSetup();
@@ -253,6 +288,14 @@ extern void handleLCDBacklight();
 extern char getNextionKey();
 extern SpotMeas readSpot();
 extern double takeAveragedLux(uint8_t samples, uint16_t delayMs);
+
+// Async Spot Measurement (non-blocking Ersatz für takeAveragedLux)
+extern bool   startAsyncSpot(uint8_t samples, uint16_t intervalMs, uint16_t settleMs);
+extern bool   tickAsyncSpot();       // Pro Frame aufrufen; true = fertig
+extern double getAsyncSpotResult();  // Ergebnis abholen (NAN bei Fehler), resettet State
+extern bool   isAsyncSpotBusy();     // true wenn SETTLE oder SAMPLING
+extern void   cancelAsyncSpot();     // Messung abbrechen
+
 extern void wdt_reset();
 
 // --- SOUND ---

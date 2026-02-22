@@ -1,145 +1,126 @@
 #include "output.h"
-#include "config.h"
+#include <U8g2lib.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 
-TwoWire WireOLED = TwoWire(1);
-Adafruit_SSD1306 displayLeft(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_SSD1306 displayRight(SCREEN_WIDTH, SCREEN_HEIGHT, &WireOLED, -1);
+// I2C Pins für den C6 (gemäß deiner Config)
+#define OLED_SDA 6
+#define OLED_SCL 7
 
-#define BUZZER_CHANNEL 0
+// Initialisierung des Displays (SSD1306, 128x64)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
-// Hardware-Offsets für 0.42" Displays (72x40 auf 128x64 Controller)
-#define OFFSET_X 28
-#define OFFSET_Y 12 
+// Globale Variablen für den Display-Inhalt (werden von main.cpp befüllt)
+char currentHeader[16] = "[ BEREIT ]";
+char currentLine1[16] = "Warte auf S3...";
+char currentLine2[16] = "";
+uint8_t currentHistogram[11] = {0}; // Zonen 0 bis X
 
-// Hilfsfunktion: Cursor setzen inkl. Totbereich-Übersprung
-void setCursorOffset(Adafruit_SSD1306 &disp, int x, int y) {
-    disp.setCursor(x + OFFSET_X, y + OFFSET_Y);
-}
+// State-Variablen für das Display-Management
+unsigned long lastDisplayUpdate = 0;
+bool displayNeedsUpdate = true;
+bool isDisplaySleeping = false;
+const unsigned long DISPLAY_SLEEP_TIMEOUT = 30000; // 30 Sekunden Inaktivität
 
-// Hilfsfunktion: Linien zeichnen inkl. Totbereich-Übersprung
-void drawLineOffset(Adafruit_SSD1306 &disp, int x0, int y0, int x1, int y1, uint16_t color) {
-    disp.drawLine(x0 + OFFSET_X, y0 + OFFSET_Y, x1 + OFFSET_X, y1 + OFFSET_Y, color);
-}
-
-void initOutput() {
-    ledcSetup(BUZZER_CHANNEL, 2000, 8); 
-    ledcAttachPin(PIN_BUZZER, BUZZER_CHANNEL);
-    ledcWriteTone(BUZZER_CHANNEL, 0);   
+void setupDisplay() {
+    Wire.begin(OLED_SDA, OLED_SCL);
+    u8g2.begin();
+    u8g2.clearBuffer();
     
-    WireOLED.begin(I2C_SDA_OLED, I2C_SCL_OLED);
+    // Boot Screen
+    u8g2.setFont(u8g2_font_helvB08_tr);
+    u8g2.drawStr(10, 30, "DUKATIMER C6");
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(10, 45, "Verbinde mit S3...");
+    u8g2.sendBuffer();
+}
 
-    bool leftOK = displayLeft.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-    bool rightOK = displayRight.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+void drawHistogram() {
+    // Parameter für das Balkendiagramm im unteren Display-Bereich
+    const int startX = 2;       // Links einrücken
+    const int startY = 63;      // Unten anfangen (Y wächst nach unten!)
+    const int maxBarHeight = 24; // Maximale Höhe der Balken
+    const int barWidth = 9;     // Breite eines Balkens
+    const int barSpacing = 2;   // Abstand zwischen Balken
+    
+    // Grundlinie zeichnen
+    u8g2.drawHLine(0, startY, 128);
+    
+    // Ziffern 0, 5, X (10) als Orientierungshilfe ganz unten (optional, falls Platz ist)
+    // Wir setzen sie knapp über die Grundlinie
+    u8g2.setFont(u8g2_font_4x6_tr);
+    u8g2.drawStr(2, 62, "0");
+    u8g2.drawStr(58, 62, "V");
+    u8g2.drawStr(115, 62, "X");
 
-    if(!leftOK || !rightOK) {
-        for(int i=0; i<3; i++) { beep(2000, 100); delay(100); }
+    // Die 11 Zonen iterieren
+    for (int i = 0; i < 11; i++) {
+        // Wert aus Array holen (0-255)
+        uint8_t val = currentHistogram[i];
+        if (val == 0) continue; // Nichts zu zeichnen
+        
+        // Höhe mappen: 0-255 auf 1-24 Pixel
+        int h = map(val, 0, 255, 1, maxBarHeight);
+        
+        // X-Position berechnen
+        int x = startX + (i * (barWidth + barSpacing));
+        
+        // Y-Position der oberen linken Ecke des Balkens
+        int y = startY - h;
+        
+        // Balken zeichnen (gefülltes Rechteck)
+        u8g2.drawBox(x, y, barWidth, h);
     }
-
-    displayLeft.clearDisplay();
-    displayLeft.setTextColor(SSD1306_WHITE);
-    displayLeft.display();
-
-    displayRight.clearDisplay();
-    displayRight.setTextColor(SSD1306_WHITE);
-    displayRight.display();
 }
 
-void showStartup() {
-    displayLeft.clearDisplay();
-    displayLeft.setTextSize(1);
-    setCursorOffset(displayLeft, 0, 10);
-    displayLeft.print(F("Probe"));
-    displayLeft.display();
+void updateDisplay() {
+    // Nichts tun, wenn das Display schläft (Stromsparen)
+    if (isDisplaySleeping) return;
 
-    displayRight.clearDisplay();
-    displayRight.setTextSize(1);
-    setCursorOffset(displayRight, 0, 10);
-    displayRight.print(F("Init..."));
-    displayRight.display();
+    // Wir rendern nur neu, wenn es auch neue Daten gab
+    if (!displayNeedsUpdate) return;
+
+    u8g2.clearBuffer();
     
-    beep(1000, 100);
-    delay(100);
-    beep(1500, 100);
-}
-
-void showError(const char* msg) {
-    displayLeft.clearDisplay();
-    setCursorOffset(displayLeft, 0, 10);
-    displayLeft.setTextSize(1);
-    displayLeft.print(F("ERROR"));
-    displayLeft.display();
-
-    displayRight.clearDisplay();
-    setCursorOffset(displayRight, 0, 10);
-    displayRight.setTextSize(1);
-    displayRight.print(msg);
-    displayRight.display();
-}
-
-void updateDisplay(float lux, long encVal, uint32_t seq, bool txOK) {
-    // --- LINKES DISPLAY: Messwerte ---
-    displayLeft.clearDisplay();
-    displayLeft.setTextSize(1);
-    setCursorOffset(displayLeft, 0, 0);
-    displayLeft.print(F("Lux:"));
+    // 1. HEADER (Top-Bar, invertiert oder umrahmt für gute Lesbarkeit)
+    u8g2.setFont(u8g2_font_helvB08_tr);
+    u8g2.drawBox(0, 0, 128, 11);
+    u8g2.setDrawColor(0); // Schriftfarbe auf Schwarz (Invertiert)
     
-    if (lux >= 100000.0) {
-        displayLeft.setTextSize(1);
-    } else {
-        displayLeft.setTextSize(2);
+    // Text zentrieren (rudimentär)
+    int headerWidth = u8g2.getStrWidth(currentHeader);
+    int startX = (128 - headerWidth) / 2;
+    u8g2.drawStr(startX, 9, currentHeader);
+    
+    u8g2.setDrawColor(1); // Zurück auf Weiß für den Rest
+    
+    // 2. HAUPT-TEXTE (Zeile 1 & 2)
+    u8g2.setFont(u8g2_font_helvB10_tr); // Größere Schrift für die Zeit
+    u8g2.drawStr(5, 25, currentLine1);
+    
+    u8g2.setFont(u8g2_font_helvB08_tr);
+    u8g2.drawStr(5, 38, currentLine2);
+    
+    // 3. ZONEN-HISTOGRAMM
+    drawHistogram();
+    
+    // Puffer auf das Display schieben
+    u8g2.sendBuffer();
+    
+    displayNeedsUpdate = false;
+}
+
+void wakeDisplay() {
+    if (isDisplaySleeping) {
+        u8g2.setPowerSave(0); // Display wieder einschalten
+        isDisplaySleeping = false;
+        displayNeedsUpdate = true; // Einmal sofort neu zeichnen
     }
-    setCursorOffset(displayLeft, 0, 16);
-    
-    if (lux < 100.0) {
-        displayLeft.print(lux, 1); 
-    } else {
-        displayLeft.print(lux, 0); 
-    }
-
-    // --- NEU: Dynamischer ESP-NOW Indikator unten (Y=36) ---
-    if (txOK) {
-        // Durchgehender Pfeil nach rechts (Senden erfolgreich)
-        drawLineOffset(displayLeft, 0, 36, 68, 36, SSD1306_WHITE); // Hauptlinie
-        drawLineOffset(displayLeft, 64, 33, 68, 36, SSD1306_WHITE); // Pfeilspitze oben
-        drawLineOffset(displayLeft, 64, 39, 68, 36, SSD1306_WHITE); // Pfeilspitze unten
-    } else {
-        // Gestrichelte Linie ohne Pfeilspitze (Fehler/Keine Verbindung)
-        for (int i = 0; i < 68; i += 8) {
-            drawLineOffset(displayLeft, i, 36, i + 4, 36, SSD1306_WHITE);
-        }
-    }
-
-    displayLeft.display();
-
-    // --- RECHTES DISPLAY: Status & UI ---
-    displayRight.clearDisplay();
-    
-    displayRight.setTextSize(1);
-    setCursorOffset(displayRight, 0, 0);
-    displayRight.print(txOK ? F("TX OK") : F("TX ERR"));
-    
-    setCursorOffset(displayRight, 0, 16);
-    displayRight.print(F("Enc: "));
-    displayRight.print(encVal);
-
-    setCursorOffset(displayRight, 0, 32);
-    displayRight.print(F("Seq: "));
-    displayRight.print(seq % 100);
-    
-    displayRight.display();
+    lastDisplayUpdate = millis(); // Timeout zurücksetzen
 }
 
-void beep(int freq, int duration) {
-    ledcWriteTone(BUZZER_CHANNEL, freq); 
-    delay(duration);                     
-    ledcWriteTone(BUZZER_CHANNEL, 0);    
-}
-
-void clickSound() {
-    ledcWriteTone(BUZZER_CHANNEL, 2000);
-    delay(5);
-    ledcWriteTone(BUZZER_CHANNEL, 0);
+void checkDisplaySleep() {
+    if (!isDisplaySleeping && (millis() - lastDisplayUpdate > DISPLAY_SLEEP_TIMEOUT)) {
+        u8g2.setPowerSave(1); // OLED in Tiefschlaf versetzen
+        isDisplaySleeping = true;
+    }
 }
