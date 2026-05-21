@@ -1,0 +1,198 @@
+================================================================================
+  DUKATIMER v0.5 — Bedienungsablauf: Nextion-Firmware per USB-Bridge flashen
+================================================================================
+
+Letzte Aktualisierung: 2026-03-14
+Gilt für Firmware-Stand: v0.5 (MODE_BRIDGE implementiert, HW_Bridge.cpp)
+
+
+--------------------------------------------------------------------------------
+VORAUSSETZUNGEN
+--------------------------------------------------------------------------------
+
+  PC-Software:
+    - Nextion Editor (https://nextion.tech/nextion-editor/) oder
+      das Nextion Uploader-Tool (nextion-uploader-win.exe)
+    - USB-CDC-Treiber für den ESP32-S3 installiert (ARDUINO_USB_CDC_ON_BOOT=1,
+      daher kein separater VCP-Treiber nötig – Standard Windows CDC reicht)
+
+  Hardware:
+    - Dukatimer per USB (CDC) mit dem PC verbunden
+    - Nextion-Display physisch an die Basisstation angeschlossen:
+        Nextion RX  →  ESP32-S3 Pin 2  (NEXTION_TX)
+        Nextion TX  →  ESP32-S3 Pin 1  (NEXTION_RX)
+        VCC 5 V, GND
+    - Nextion muss eingeschaltet sein (Display leuchtet oder zeigt Bootscreen)
+
+  Zustand der Serial-Verbindung:
+    - Den seriellen Monitor (PlatformIO / Arduino IDE / PuTTY usw.) VOR dem
+      Upload-Schritt schließen. Der COM-Port darf von keiner anderen Anwendung
+      blockiert sein, weil sowohl Bridge- als auch Upload-Tool denselben Port
+      nutzen.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 1 — SETUP-MENÜ ÖFFNEN
+--------------------------------------------------------------------------------
+
+  Am Gerät:
+    1. Im Normalbetrieb den MODE-Encoder oder den BACK-Taster drücken, bis
+       „SYSTEM SETUP / Encoder to Nav" auf dem LCD erscheint.
+       (Alternative: je nach aktuellem Modus den SETUP-Einstiegspfad nutzen.)
+
+  LCD bestätigt: „SYSTEM SETUP / Encoder to Nav"
+
+
+--------------------------------------------------------------------------------
+SCHRITT 2 — ZU „USB BRIDGE" NAVIGIEREN
+--------------------------------------------------------------------------------
+
+  Am Gerät:
+    2. Mit Encoder 1 (BACK-Encoder, ENC_SOFT_A/B) nach unten scrollen.
+       Das Setup-Menü hat 15 Einträge (Index 0–14). USB BRIDGE ist der
+       letzte Eintrag (Index 14).
+
+       Reihenfolge zur Orientierung:
+         0  STD TIME BW
+         1  SPLIT MODE
+         2  LCD BRIGHT
+         3  FOCUS BRIGHT
+         4  SAFE LIGHT MAX
+         5  FLASH GLOBAL
+         6  SOUND MODE
+         7  FLASH LEVEL
+         8  FLASH COLOR
+         9  SELECT PAPER     [Aktion]
+        10  SAVE PAPER       [Aktion]
+        11  CALIB START      [Aktion]
+        12  WIRELESS PROBE
+        13  C6 DARK CALIB    [Aktion]
+        14  USB BRIDGE       [Aktion]  ← Ziel
+
+  LCD zeigt bei Ankunft: „USB BRIDGE / ENTER = START"
+
+
+--------------------------------------------------------------------------------
+SCHRITT 3 — BRIDGE AKTIVIEREN
+--------------------------------------------------------------------------------
+
+  Am Gerät:
+    3. ENTER-Taster (PIN_SW_ENTER, Pin 41) drücken.
+
+  LCD zeigt sofort: „BRIDGE ACTIVE / BACK = EXIT"
+  Akustisch: ein Bestätigungston (SND_OK)
+
+  Intern: Das Gerät wechselt in MODE_BRIDGE.
+    - Core 0 stellt alle regulären Nextion-Befehle ein.
+    - Serial2 (115 200 Baud, 8N1) wird exklusiv für die Bridge gesperrt.
+    - Jedes Byte vom USB-CDC-Port (PC) wird 1:1 an Serial2 (Nextion) 
+      weitergeleitet und umgekehrt.
+
+  HINWEIS: Das LCD bleibt stehen und zeigt weiterhin „BRIDGE ACTIVE".
+           Das ist korrekt – die Display-Ausgabe wurde beim Bridge-Eintritt
+           gesichert und wird nicht aktualisiert.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 4 — NEXTION-FIRMWARE ÜBERTRAGEN (PC-SEITE)
+--------------------------------------------------------------------------------
+
+  Am PC:
+    4a. Nextion Editor öffnen.
+        → Debug → Upload  (oder direkt „Upload" in der Toolbar)
+        → Zieldatei: die fertige .tft-Datei auswählen
+
+    4b. Verbindungseinstellungen im Upload-Dialog:
+          COM-Port:   der COM-Port des Dukatimers (z. B. COM14)
+          Baudrate:   115200
+
+    4c. Upload starten.
+
+  Der Nextion-Bootloader übernimmt die Kommunikation über die Bridge.
+  Der Fortschrittsbalken im Nextion Editor steigt normal an.
+  Typische Übertragungsdauer: 30–90 Sekunden je nach .tft-Größe.
+
+  HINWEIS: Schlägt der Upload-Start fehl (Timeout), Nextion kurz stromlos
+           machen und erneut versuchen – der Nextion-Bootloader erwartet
+           den Upload-Handshake kurz nach dem Einschalten.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 5 — BRIDGE BEENDEN
+--------------------------------------------------------------------------------
+
+  Am Gerät:
+    5. Nach erfolgreichem Upload (Nextion Editor meldet „Upload Complete")
+       einen beliebigen Taster drücken (BACK, ENTER, START, GRADE usw.).
+
+  LCD zeigt kurz: „USB BRIDGE / BRIDGE STOPPED"  (ca. 600 ms)
+  Danach: automatische Rückkehr ins Setup-Menü, Eintrag „USB BRIDGE".
+
+  Intern: xNexMutex wird wieder freigegeben, Core 0 nimmt normale
+          Nextion-Kommunikation wieder auf.
+
+
+--------------------------------------------------------------------------------
+SCHRITT 6 — NORMALBETRIEB PRÜFEN
+--------------------------------------------------------------------------------
+
+  6. Gerät kurz neu starten (Reset-Taster oder Stromtrennung), damit das
+     Nextion seine neue Firmware bootet und sich mit dem ESP32-S3
+     synchronisiert.
+
+  Erwartetes Startverhalten nach Reset:
+    LCD:     „DUKATIMER v0.5 / System Boot..."   (ca. 1 s, direkt in setup())
+    LCD:     „SYSTEM DIAG / START=WEITER"         (max. 4 s oder Tastendruck)
+    Nextion: zeigt Nextion-Bootpage (page BOOT)
+    LCD → Normalbetrieb: z. B. „BW Mode  1/3 / T:8.0s G:2.5"
+
+
+--------------------------------------------------------------------------------
+FEHLERBEHEBUNG
+--------------------------------------------------------------------------------
+
+  Problem: LCD zeigt „BRIDGE ERROR / NEX MUTEX NULL"
+  Ursache: xNexMutex wurde beim Start nicht initialisiert (DM_init nicht
+           aufgerufen).
+  Lösung:  Gerät neu starten; tritt der Fehler wiederholt auf, prüfen ob
+           DM_init() in setup() vor startSetupMenu() liegt.
+
+  Problem: Nextion Editor meldet „Upload failed" / Timeout
+  Ursache a) Serial Monitor ist noch offen → Monitor schließen, neu versuchen.
+  Ursache b) Baudrate-Mismatch → Im Edit sicherstellen dass 115200 gewählt.
+  Ursache c) Nextion hat den Handshake-Window verpasst → Nextion Strom-Aus/An,
+             dann innerhalb von ~2 s Upload neu starten.
+
+  Problem: Bridge reagiert nicht auf Tastendruck (kann nicht beendet werden)
+  Ursache: xInputQueue ist voll oder Core 1 läuft nicht.
+  Lösung:  Hardreset des Geräts (Strom aus/an). Die Bridge ist nicht persistent;
+           nach dem Reset befindet sich das Gerät wieder im Normalbetrieb.
+
+  Problem: Nach der Bridge zeigt das Nextion nur schwarzen Bildschirm
+  Ursache: Upload unvollständig oder .tft-Datei für falsches Nextion-Modell.
+  Lösung:  Nextion-Modellnummer der .tft-Datei mit dem verbauten Nextion
+           abgleichen, dann Upload wiederholen.
+
+
+--------------------------------------------------------------------------------
+TECHNISCHE REFERENZ (für Entwickler)
+--------------------------------------------------------------------------------
+
+  Implementierungsdateien:
+    src/HW_Bridge.cpp        — Bridge-Schleife, Mutex-Handling, Chunk-Transfer
+    src/Mode_Setup.cpp       — Menüeintrag case 14, gTimerMutex-Release vor Bridge
+    src/main.cpp             — vTaskIO Guards (DM_loop, updateNextionUI blockiert
+                               während MODE_BRIDGE)
+    include/Types.h          — enum Mode { ..., MODE_BRIDGE }
+    include/Globals.h        — extern xNexMutex; void enterNextionUploadMode();
+
+  Serielle Belegung:
+    NEXTION_RX = Pin 1 (ESP empfängt von Nextion TX)
+    NEXTION_TX = Pin 2 (ESP sendet an Nextion RX)
+    Baudrate nach DM_init: 115 200
+
+  Abbruch-Mechanismus:
+    Jedes Event in xInputQueue bricht die Bridge ab (EVT_*_PRESSED).
+    Das Event wird konsumiert und NICHT an andere Handler weitergereicht.
+
+================================================================================

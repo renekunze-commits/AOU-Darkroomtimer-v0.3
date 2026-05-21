@@ -1,190 +1,395 @@
-/* Mode_TestStrip.ino - Teststreifen-Modus (Non-blocking)
+/* Mode_TestStrip.cpp - Strikter 3-Phasen-Teststreifen (Dose-Driven)
 
-   Beschreibung:
-   - Berechnet eine Serie von Belichtungszeiten (multigrade/ev steps)
-   - Startet jede Belichtung nicht-blockierend: setzt `tsExposureActive` und
-     `tsExposureEnd` statt `delay()`.
-   - UI: Encoder 1 ändert Basiszeit, Encoder 2 setzt EV-Schrittweite; Enter startet
-     den aktuellen Streifen.
+   Architektur:
+   - Phase 1: TS_SETUP     (Konfiguration)
+   - Phase 2: TS_EXECUTE   (Belichtungssequenz)
+   - Phase 3: TS_EVALUATE  (Auswahl + Closed Loop)
+
+   Kernregel:
+   - Interner Zustand basiert auf Dose (Lux-Sekunden), nicht auf Zeit.
+   - Zeiten werden nur zur UI aus Dose/Flux abgeleitet.
 */
+
 #include <Arduino.h>
+#include <math.h>
 #include "Globals.h"
 #include "Config.h"
+#include "Logic_Timer.h"
+#include "ExposureEngine.h"
 
-// Externe
-extern ESP32Encoder encSoft;
-extern ESP32Encoder encHard;
-extern BtnState sEnter;
-extern BtnState sBack;
-
+// Externe Ausgaben/Helfer
 extern void beepNav();
 extern void beepValue();
 extern void beepOk();
-extern void beepStartPattern();
-extern void beepEndPattern();
+extern void beepWarnLong();
 extern void smartLCD(const char* l1, const char* l2);
 extern void PaintLED(int r, int g, int b);
-extern long secondsToUnits(double s, int tgl);
+extern void updateNextionUI(bool force);
 
-// Helper
-static long getEnc1TS() {
-  static long lastPos = 0;
-  long newPos = encSoft.getCount() / 2;
-  long delta = newPos - lastPos;
-  lastPos = newPos;
-  return delta;
+// Aktueller Messfluss (Fallback in Dunkelheit)
+extern float baseFlux;
+
+// ---------------------------------------------------------------------------
+// Lokale State-Machine
+// ---------------------------------------------------------------------------
+enum TSPhase {
+  PHASE_TS_SETUP = 0,
+  PHASE_TS_EXECUTE,
+  PHASE_TS_EVALUATE
+};
+
+static TSPhase tsPhase = PHASE_TS_SETUP;
+
+static uint8_t tsStrips = 5;               // Nur 3, 5, 7
+static const float tsEvStepTable[] = { 1.0f/6.0f, 1.0f/4.0f, 1.0f/3.0f, 1.0f/2.0f, 1.0f };
+static const uint8_t tsEvStepCount = sizeof(tsEvStepTable) / sizeof(tsEvStepTable[0]);
+static uint8_t tsEvStepIdx = 2;            // Default 1/3 EV
+
+static float tsStartDoseBW = 10000.0f;     // Start-Dose aus BW-Basis
+static float tsStripDose[7] = {0};         // Maximal 7 Streifen
+static float tsStripSec[7] = {0};          // UI-Ableitung
+
+static uint8_t tsExecIndex = 0;            // 0..tsStrips-1
+
+static uint8_t tsEvalIndex = 0;            // 0..tsStrips-1
+
+// Overlay-Rücksprungziel: Hauptmodus (BW/SG), nicht hart BW erzwingen.
+static Mode tsReturnMode = MODE_BW;
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen
+// ---------------------------------------------------------------------------
+static float getCurrentFluxForUI() {
+  float flux = baseFlux;
+  if (flux <= 0.001f) flux = 1.0f;
+  return flux;
 }
 
-static long getEnc2TS() {
-  static long lastPos = 0;
-  long newPos = encHard.getCount() / 2;
-  long delta = newPos - lastPos;
-  lastPos = newPos;
-  return delta;
+static float getStepEVFromGlobal() {
+  if (globalStepMode == STEP_SIXTH) return 1.0f/6.0f;
+  if (globalStepMode == STEP_HALF)  return 1.0f/2.0f;
+  if (globalStepMode == STEP_FULL)  return 1.0f;
+  return 1.0f/3.0f;
 }
 
-// Teststrip: nicht-blockierende Exposure-Logik
-static bool tsExposureActive = false;
-static unsigned long tsExposureEnd = 0;
-static unsigned long tsMsgUntil = 0;
+static float getCurrentTsEvStep() {
+  return tsEvStepTable[tsEvStepIdx];
+}
 
-// startTestStripMode:
-// - Initialisiert den Teststreifen-Modus: setzt Kanal (BW/Soft/Hard), Anzahl und EV-Schritt
-// - Setzt eine kurze, nicht-blockierende Pause damit die UI den Modus anzeigen kann
+static void buildExecuteBar(char* out, size_t outSize) {
+  if (outSize < 4) return;
+  String s = "[";
+  for (uint8_t i = 0; i < tsStrips; i++) {
+    if (i < tsExecIndex) s += "X";
+    else s += "O";
+    if (i + 1 < tsStrips) s += " ";
+  }
+  s += "]";
+  snprintf(out, outSize, "%s", s.c_str());
+}
+
+static void buildEvaluateCursor(char* out, size_t outSize) {
+  if (outSize < 4) return;
+  String s = "[";
+  for (uint8_t i = 0; i < tsStrips; i++) {
+    s += (i == tsEvalIndex) ? "^" : "-";
+    if (i + 1 < tsStrips) s += " ";
+  }
+  s += "]";
+  snprintf(out, outSize, "%s", s.c_str());
+}
+
+static void recalcStripSeries() {
+  float flux = getCurrentFluxForUI();
+  float evStep = getCurrentTsEvStep();
+
+  // =================================================================
+  // PFLICHTENHEFT FIX: Serien-Zentrierung um die Basis-Dosis.
+  // Laut Pflichtenheft: "Die aktuelle Basis-Dosis ist immer exakt 
+  // die Mitte der Serie." D.h. bei 5 Streifen a 1/3 EV:
+  // Streifen 0 = Basis * 2^(-2 * 1/3) ... Streifen 4 = Basis * 2^(+2 * 1/3)
+  // ALT (nur aufwärts, nicht zentralisiert):
+  // for (uint8_t i = 0; i < tsStrips; i++) {
+  //     float d = tsStartDoseBW * powf(2.0f, (float)i * evStep);
+  //     ...
+  // }
+  // =================================================================
+  int halfStrips = (int)tsStrips / 2; // Ganzzahlig: bei 5 = 2, bei 7 = 3
+  for (uint8_t i = 0; i < tsStrips; i++) {
+    // Offset relativ zur Mitte: i=0 -> -halfStrips, i=half -> 0, i=last -> +halfStrips
+    int offset = (int)i - halfStrips;
+    float d = tsStartDoseBW * powf(2.0f, (float)offset * evStep);
+    if (d < 0.1f) d = 0.1f;
+    tsStripDose[i] = d;
+    tsStripSec[i] = d / flux;
+  }
+  updateNextionUI(true);
+}
+
+static void enterEvaluatePhase() {
+  tsPhase = PHASE_TS_EVALUATE;
+  tsEvalIndex = 0;
+  ts = TS_RUNNING; // KompatibilitÃ¤t zum bestehenden globalen TS-State
+  beepOk();
+  updateNextionUI(true);
+}
+
+static void exitToBW(bool applied) {
+  ExposureEngine_Abort();  // Sicher abbrechen (setzt isMeasuring, Licht, Blackout zurück)
+  ts = TS_OFF;
+
+  if (applied) {
+    setDoseBW(tsStripDose[tsEvalIndex]);
+    refreshDisplayVariables();
+    currentMode = tsReturnMode;
+    beepOk();
+    smartLCD("TS APPLY MAIN", "");
+  } else {
+    beepWarnLong();
+    smartLCD("TS CANCEL", "");
+  }
+  updateNextionUI(true);
+}
+
+void setTestStripReturnMode(Mode mode) {
+  if (mode == MODE_BW || mode == MODE_SG) {
+    tsReturnMode = mode;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 void startTestStripMode() {
-  // Init wie Legacy: Kanalwahl aus Kontext
-  if (currentMode == MODE_BW) tsCh = TS_BW;
-  else tsCh = TS_SOFT; // Default im SG Modus
+  // Fallback für direkte Aufrufe: Wenn aus BW/SG gestartet, dort hin zurück.
+  if (currentMode == MODE_BW || currentMode == MODE_SG) {
+    tsReturnMode = currentMode;
+  }
 
+  tsPhase = PHASE_TS_SETUP;
   ts = TS_SETUP;
-  tsN = 6; // Default wie Legacy
-  tsEv = 1.0/3.0; // Default 1/3 EV
 
-  // Encoders nullen
-  getEnc1TS();
-  getEnc2TS();
+  tsStrips = 5;
+  tsEvStepIdx = 2; // 1/3 EV
 
-  lcd.clear(); lcd.print("TEST STRIP MODE");
-  tsMsgUntil = millis() + 500;
-  tsK = 0; tsSum = 0.0;
-  tsExposureActive = false;
+  tsStartDoseBW = getDoseBW();
+  if (tsStartDoseBW < 0.1f) tsStartDoseBW = 0.1f;
+
+  tsExecIndex = 0;
+  tsEvalIndex = 0;
+
+  recalcStripSeries();
+
+  // Queue leeren
+  InputEvent evt;
+  while (xQueueReceive(xInputQueue, &evt, 0) == pdTRUE) { /* flush */ }
+
+  smartLCD("TEST STRIP SETUP", "");
+  updateNextionUI(true);
 }
 
 void runTestStripLoop(char key) {
+  (void)key;
   unsigned long now = millis();
 
-  // Input
-  bool evEnter = updateButton(sEnter, PIN_SW_ENTER, now);
-  bool evBack  = updateButton(sBack,  PIN_SW_BACK,  now);
-  long dTime   = getEnc1TS();
-  long dSteps  = getEnc2TS();
+  // =================================================================
+  // PFLICHTENHEFT FIX: Korrekte Event-Erkennung für alle 3 Phasen.
+  // Laut Pflichtenheft:
+  //   Phase 1: Enc 2 Kurz (*) = Bestätigen, Enc 3 Kurz (#) = Abbruch
+  //   Phase 2: Start-Taster = Nächster Strip, Enc 3 Kurz (#) = Abbruch
+  //   Phase 3: Enc 2 Kurz (*) = Auswahl, Enc 3 Kurz (#) = Verwerfen
+  // ALT: evBack (Enc 1 = EVT_BACK_PRESSED) wurde fälschlich als Abbruch
+  //      und evEnter (Enc 2) als Start-Taster verwendet.
+  // =================================================================
+  bool evEnter    = false;  // Enc 2 Kurz = Bestätigen (*)
+  bool evGrade    = false;  // Enc 3 Kurz = Abbruch (#)
+  bool evStart    = false;  // Start-Taster = Nächster Strip
+  // ALT: bool evBack  = false;
+  long dEnc1   = 0;
+  long dEnc2   = 0;
+  long dEnc3   = 0;
 
-  if (now < tsMsgUntil) return;
+  InputEvent evtQueue;
+  while (xQueueReceive(xInputQueue, &evtQueue, 0) == pdTRUE) {
+      if (evtQueue.type == EVT_ENTER_PRESSED) evEnter = true;
+      // PFLICHTENHEFT FIX: Abbruch liegt auf Enc 3 (GRADE), nicht Enc 1 (BACK)
+      // ALT: if (evtQueue.type == EVT_BACK_PRESSED)  evBack = true;
+      if (evtQueue.type == EVT_GRADE_PRESSED) evGrade = true;
+      // PFLICHTENHEFT FIX: Start-Taster für die Belichtungsauslösung
+      if (evtQueue.type == EVT_START_PRESSED) evStart = true;
+      if (evtQueue.type == EVT_ENC_SOFT)      dEnc1 += evtQueue.value;
+      if (evtQueue.type == EVT_ENC_HARD)      dEnc2 += evtQueue.value;
+      if (evtQueue.type == EVT_ENC_GRADE)     dEnc3 += evtQueue.value;
+  }
 
-  // Exposure Ablauf
-  if (tsExposureActive) {
-    if (now >= tsExposureEnd) {
-      PaintLED(0,0,0);
-      beepEndPattern();
-      tsExposureActive = false;
-      tsK++;
-      tsMsgUntil = now + 200;
+  // ------------------------------------------------------------
+  // Globaler Abbruch (Enc 3 Kurz = # in allen Phasen)
+  // PFLICHTENHEFT FIX: War früher auf evBack (Enc 1), jetzt auf evGrade (Enc 3)
+  // ------------------------------------------------------------
+  if (evGrade) {
+    exitToBW(false);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // PHASE 1: TS_SETUP
+  // ------------------------------------------------------------
+  if (tsPhase == PHASE_TS_SETUP) {
+    // =================================================================
+    // PFLICHTENHEFT FIX: Encoder-Belegung Phase 1 (Setup)
+    // Laut Pflichtenheft:
+    //   Encoder 1 (Links) = EV-Step wählen (Schrittweite)
+    //   Encoder 2 (Mitte) = Anzahl Streifen (3, 5, 7)
+    // ALT: Encoder 1 verschob die Start-Dosis (nicht im Pflichtenheft!)
+    //      Encoder 3 wählte den EV-Schritt (sollte Enc 1 sein)
+    // =================================================================
+
+    // Encoder 1: EV-Schrittweite wählen (Pflichtenheft: "EV-Step wählen")
+    // ALT: Encoder 1 war Dosis-Verschiebung:
+    // if (dEnc1 != 0) {
+    //   float evStep = getStepEVFromGlobal();
+    //   tsStartDoseBW *= powf(2.0f, (float)dEnc1 * evStep);
+    //   if (tsStartDoseBW < 0.1f) tsStartDoseBW = 0.1f;
+    //   recalcStripSeries();
+    //   beepNav();
+    // }
+    if (dEnc1 != 0) {
+      int next = (int)tsEvStepIdx + (dEnc1 > 0 ? 1 : -1);
+      if (next < 0) next = (int)tsEvStepCount - 1;
+      if (next >= (int)tsEvStepCount) next = 0;
+      tsEvStepIdx = (uint8_t)next;
+      recalcStripSeries();
+      beepValue();
+    }
+
+    // Encoder 2: Streifenanzahl 3/5/7
+    if (dEnc2 != 0) {
+      if (dEnc2 > 0) {
+        if (tsStrips == 3) tsStrips = 5;
+        else if (tsStrips == 5) tsStrips = 7;
+        else tsStrips = 3;
+      } else {
+        if (tsStrips == 7) tsStrips = 5;
+        else if (tsStrips == 5) tsStrips = 3;
+        else tsStrips = 7;
+      }
+      recalcStripSeries();
+      beepValue();
+    }
+
+    // Encoder 3: Im Setup nicht belegt (nur Enc 3 Taster = globaler Abbruch)
+    // ALT: Encoder 3 war EV-Step-Auswahl (wurde nach Enc 1 verschoben):
+    // if (dEnc3 != 0) {
+    //   int next = (int)tsEvStepIdx + (dEnc3 > 0 ? 1 : -1);
+    //   if (next < 0) next = (int)tsEvStepCount - 1;
+    //   if (next >= (int)tsEvStepCount) next = 0;
+    //   tsEvStepIdx = (uint8_t)next;
+    //   recalcStripSeries();
+    //   beepValue();
+    // }
+    (void)dEnc3; // Enc 3 Drehen: Im Setup nicht belegt
+
+    char l1[17];
+    char l2[17];
+    snprintf(l1, sizeof(l1), "S:%u EV:%0.2f", tsStrips, getCurrentTsEvStep());
+    snprintf(l2, sizeof(l2), "D:%0.0f #=EXEC", tsStartDoseBW);
+    smartLCD(l1, l2);
+
+    // PFLICHTENHEFT FIX: Enc 2 Taster Kurz (*) = Bestätigen → Execute
+    // (War vorher korrekt auf evEnter, Kommentar aktualisiert)
+    if (evEnter) {
+      tsPhase = PHASE_TS_EXECUTE;
+      ts = TS_RUNNING;
+      tsExecIndex = 0;
+      ExposureEngine_Abort();  // Sicherstellen, dass keine alte Belichtung läuft
+      beepOk();
+      updateNextionUI(true);
     }
     return;
   }
 
-  // Abbruch
-  if (evBack) {
-    ts = TS_OFF;
-    PaintLED(0,0,0);
-    lcd.clear(); lcd.print("TEST STRIP END"); tsMsgUntil = now + 500; return;
+  // ------------------------------------------------------------
+  // PHASE 2: TS_EXECUTE
+  // ------------------------------------------------------------
+  if (tsPhase == PHASE_TS_EXECUTE) {
+    // Engine wird zentral aus vTaskRealtime geticked
+    if (ExposureEngine_IsRunning()) {
+      return; // Während Belichtung: Keine weitere Verarbeitung
+    }
+    if (ExposureEngine_IsDone()) {
+      ExposureEngine_Acknowledge();
+      tsExecIndex++;
+      updateNextionUI(true);
+      if (tsExecIndex >= tsStrips) {
+        enterEvaluatePhase();
+        return;
+      }
+    }
+
+    char l1[17];
+    char l2[17];
+    buildExecuteBar(l2, sizeof(l2));
+    if (tsExecIndex < tsStrips) {
+      snprintf(l1, sizeof(l1), "STRIP %u/%u %0.1fs", (unsigned)(tsExecIndex + 1), (unsigned)tsStrips, tsStripSec[tsExecIndex]);
+    } else {
+      snprintf(l1, sizeof(l1), "STRIP DONE");
+    }
+    smartLCD(l1, l2);
+
+    // =================================================================
+    // PFLICHTENHEFT FIX: Start-Taster startet den nächsten Streifen
+    // ExposureEngine übernimmt: Pre-Wait, Licht, Metronom, Post-Wait, isMeasuring
+    // =================================================================
+    if (!ExposureEngine_IsRunning() && evStart && tsExecIndex < tsStrips) {
+      unsigned long durationMs = (unsigned long)(tsStripSec[tsExecIndex] * 1000.0f);
+      if (durationMs < 100) durationMs = 100;
+      ExposureEngine_StartTime(durationMs, pwmValGreen, pwmValBlue);
+    }
+    return;
   }
 
-  // --- STATE MACHINE ---
-  if (ts == TS_SETUP) {
-    // Setup-UI: EV-Raster und Streifenanzahl wie Legacy
-    String l1 = "N:" + String(tsN) + "  dEV:" + String(tsEv, 2);
-    String l2 = "T:" + String((currentMode == MODE_BW) ? time_bw : (tsCh == TS_HARD ? time_hard : time_soft), 1) + "s #=GO";
-
-    // Encoder 1: Zeit ändern
-    double *baseT = (currentMode == MODE_BW) ? &time_bw : (tsCh == TS_HARD ? &time_hard : &time_soft);
-    if (dTime != 0) {
-      double fac = (dTime > 0) ? 1.1 : 0.9;
-      *baseT *= fac;
-      if (*baseT < 0.5) *baseT = 0.5;
+  // ------------------------------------------------------------
+  // PHASE 3: TS_EVALUATE (Closed Loop)
+  // PFLICHTENHEFT: Enc 1 oder 2 = Cursor, Enc 2 Kurz = Auswahl (*),
+  //               Enc 3 Kurz = Verwerfen (#)
+  // Abbruch via evGrade wird oben bereits global abgefangen.
+  // ------------------------------------------------------------
+  if (tsPhase == PHASE_TS_EVALUATE) {
+    // H05 FIX: Encoder 1 ODER 2 bewegen den Cursor (laut Spec)
+    int cursorDelta = dEnc1 + dEnc2;
+    if (cursorDelta != 0) {
+      int next = (int)tsEvalIndex + (cursorDelta > 0 ? 1 : -1);
+      if (next < 0) next = (int)tsStrips - 1;
+      if (next >= (int)tsStrips) next = 0;
+      tsEvalIndex = (uint8_t)next;
       beepNav();
+      updateNextionUI(true);
     }
 
-    // Encoder 2: EV Schritte ändern (1/6, 1/3, 1)
-    if (dSteps != 0) {
-      if (tsEv < 0.18) tsEv = 1.0/3.0;
-      else if (tsEv < 0.34) tsEv = 1.0;
-      else tsEv = 1.0/6.0;
-      beepValue();
-    }
-
-    // Streifenanzahl per langem Druck auf sEnter (4, 6, 8, 10)
-    static unsigned long enterPressStart = 0;
-    static bool enterLongHandled = false;
-    bool enterRaw = digitalRead(PIN_SW_ENTER) == LOW;
-    if (enterRaw && enterPressStart == 0) enterPressStart = now;
-    if (!enterRaw && enterPressStart != 0) {
-      if (!enterLongHandled && (now - enterPressStart >= 800)) {
-        // Zyklisch durch 4, 6, 8, 10
-        int nextN = tsN;
-        if (tsN == 4) nextN = 6;
-        else if (tsN == 6) nextN = 8;
-        else if (tsN == 8) nextN = 10;
-        else nextN = 4;
-        tsN = nextN;
-        beepValue();
-        lcd.clear(); lcd.print("STRIPS: " + String(tsN)); tsMsgUntil = now + 500;
-        enterLongHandled = true;
-      }
-      enterPressStart = 0;
-      enterLongHandled = false;
-    }
-    if (enterRaw && (now - enterPressStart >= 800)) enterLongHandled = false;
-
-    // START
-    if (evEnter) {
-      // Zeiten berechnen wie Legacy (additiv, Center-Anchor)
-      int center = tsN / 2;
-      double *refT = (currentMode == MODE_BW) ? &time_bw : (tsCh == TS_HARD ? &time_hard : &time_soft);
-      for(int i=0; i<tsN; i++) {
-        int diff = i - center;
-        tsA[i] = (*refT) * pow(2.0, diff * tsEv);
-        if (tsA[i] < 0.10) tsA[i] = 0.10;
-      }
-      ts = TS_RUNNING;
-      tsK = 0;
-      tsSum = 0.0;
-      beepOk();
-      lcd.clear(); lcd.print("READY TO START"); tsMsgUntil = now + 500;
-    }
+    char l1[17];
+    char l2[17];
+    snprintf(l1, sizeof(l1), "Strip %u (%0.1fs)", (unsigned)(tsEvalIndex + 1), tsStripSec[tsEvalIndex]);
+    buildEvaluateCursor(l2, sizeof(l2));
     smartLCD(l1, l2);
-  }
-  else if (ts == TS_RUNNING) {
-    if (tsK >= tsN) {
-      ts = TS_SETUP;
-      beepEndPattern();
-      lcd.clear(); lcd.print("TEST STRIP DONE"); tsMsgUntil = now + 500; return;
-    }
-    double tExp = tsA[tsK];
-    String l1 = "STRIP " + String(tsK+1) + "/" + String(tsN);
-    String l2 = "EXP: " + String(tExp, 1) + "s #=GO";
-    smartLCD(l1, l2);
+
+    // PFLICHTENHEFT FIX: Enc 2 Kurz (*) = Closed Loop anwenden
+    // (Korrekt auf evEnter, Kommentar aktualisiert)
     if (evEnter) {
-      int r=0, g=0, b=0;
-      if (currentMode == MODE_BW) { r=120; g=120; b=120; }
-      else if (tsCh == TS_SOFT)   { r=0; g=255; b=0; }
-      else                        { r=0; g=0; b=255; }
-      PaintLED(r,g,b);
-      beepStartPattern();
-      unsigned long duration = (unsigned long)(tExp * 1000);
-      tsExposureEnd = now + duration;
-      tsExposureActive = true;
-      tsSum += tExp;
+      // =================================================================
+      // PFLICHTENHEFT FIX: Zentrierte Serien-Formel
+      // Da die Serie jetzt zentriert ist (Streifen tsStrips/2 = Basis),
+      // berechnen wir die Dose korrekt mit dem Offset relativ zur Mitte.
+      // ALT (nicht zentriert):
+      // float finalDose = tsStartDoseBW * powf(2.0f, (float)tsEvalIndex * getCurrentTsEvStep());
+      // =================================================================
+      int halfStrips = (int)tsStrips / 2;
+      int offset = (int)tsEvalIndex - halfStrips;
+      float finalDose = tsStartDoseBW * powf(2.0f, (float)offset * getCurrentTsEvStep());
+      if (finalDose < 0.1f) finalDose = 0.1f;
+      tsStripDose[tsEvalIndex] = finalDose;
+      exitToBW(true);
+      return;
     }
+    return;
   }
 }

@@ -1,9 +1,9 @@
-/* HW_Sensors.ino - Sensorzugriff und Glättung
+/* HW_Sensors.cpp - Sensorzugriff und Glättung (v0.5)
 
    - Liest den TSL2591 (Luxen) aus und führt eine einfache Glättung (Gleitender Durchschnitt)
    - Implementiert Auto-Gain (passt `currentGainIdx` an und verwirft einige Frames)
-   - `readSpot()` gibt eine strukturierte Messung (SpotMeas) zurück; `takeAveragedLux`
-     führt mehrere Messungen seriell durch (blocking, aber nützlich für Kalibrierungsabläufe)
+   - `readSpot()` gibt eine strukturierte Messung (SpotMeas) zurück
+   - FIX A2: Alle I2C-Zugriffe sind strikt durch xI2CMutex geschützt!
 */
 #include <Arduino.h>
 #include "Globals.h"
@@ -16,9 +16,6 @@ static int luxBufferIdx = 0;
 static int luxBufferCount = 0;
 static double lastValidLux = NAN;
 static uint8_t sensorSkipFrames = 0; 
-
-
-
 
 SpotMeas readSpot() {
   SpotMeas m = { NAN, 0, 0, false };
@@ -59,7 +56,18 @@ SpotMeas readSpot() {
     return m;
   }
 
-  uint32_t lum = tslBase.getFullLuminosity();
+  uint32_t lum = 0;
+  
+  // FIX A2: I2C Mutex für den TSL2591 (Lesen der Luminanz)
+  if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+      lum = tslBase.getFullLuminosity();
+      xSemaphoreGive(xI2CMutex);
+  } else {
+      // I2C Bus ist blockiert. Wir überspringen diesen Zyklus sicher.
+      if (!isnan(lastValidLux)) { m.lux = lastValidLux; m.ok = true; }
+      return m;
+  }
+
   uint16_t rawFull = lum & 0xFFFF; 
   bool gainChanged = false;
 
@@ -74,8 +82,14 @@ SpotMeas readSpot() {
   if (gainChanged) {
     tsl2591Gain_t g = (currentGainIdx == 0) ? TSL2591_GAIN_LOW : 
                       (currentGainIdx == 1) ? TSL2591_GAIN_MED : TSL2591_GAIN_HIGH;
-    tslBase.setGain(g);
-    tslBase.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+                      
+    // FIX A2: I2C Mutex für Sensor-Einstellungen (Schreiben)
+    if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+        tslBase.setGain(g);
+        tslBase.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+        xSemaphoreGive(xI2CMutex);
+    }
+    
     sensorSkipFrames = 3; // Ein paar Frames verwerfen nach Gain-Change
     if (!isnan(lastValidLux)) { m.lux = lastValidLux; m.ok = true; }
     return m;
@@ -89,6 +103,8 @@ SpotMeas readSpot() {
 
   uint16_t ch0 = rawFull;
   uint16_t ch1 = lum >> 16; 
+  
+  // calculateLux ist nur interne Mathematik, greift nicht auf I2C zu!
   double curLux = tslBase.calculateLux(ch0, ch1);
   if (curLux <= 0.0001) curLux = 0.0001;
 
@@ -121,19 +137,6 @@ double takeAveragedLux(uint8_t samples, uint16_t delayMs) {
 // =============================================================================
 // ASYNC SPOT MEASUREMENT (Non-Blocking)
 // =============================================================================
-// Ersetzt den blockierenden takeAveragedLux() Aufruf durch eine State Machine,
-// die pro loop()-Durchlauf maximal eine I2C-Abfrage (~2ms) macht.
-// Ablauf: IDLE → SETTLE (LED-Abklingzeit) → SAMPLING (N Messungen) → DONE
-//
-// Warum non-blocking?
-//   takeAveragedLux(7, 110) blockiert 770ms. Währenddessen:
-//   - UI (Nextion/LCD) friert ein
-//   - Metronom stottert
-//   - ESP-NOW Pakete gehen verloren (Pufferüberlauf)
-//   Die async Version gibt nach jeder Einzelmessung (~2ms I2C) die
-//   Kontrolle an den Main Loop zurück.
-// =============================================================================
-
 enum SpotPhase : uint8_t { SPOT_IDLE = 0, SPOT_SETTLE, SPOT_SAMPLING, SPOT_DONE };
 static SpotPhase     spotPhase    = SPOT_IDLE;
 static uint8_t       spotTarget   = 0;
@@ -166,7 +169,7 @@ bool tickAsyncSpot() {
     if (spotPhase == SPOT_SETTLE) {
         if (now >= spotNextMs) {
             spotPhase  = SPOT_SAMPLING;
-            spotNextMs = now; // Erste Messung sofort
+            spotNextMs = now; 
         }
         return false;
     }

@@ -1,0 +1,820 @@
+Gemini hat gesagt
+
+Dieses Konzept konzentriert sich auf eine rein funktionale Umsetzung für das Nextion-Display, um die Hardware- und Software-Schnittstellen des Dukatimer v0.3 kurzfristig testbar zu machen. Der Fokus liegt auf der Übereinstimmung der Objekt-IDs und Namen mit dem vorhandenen Code.
+I. Das funktionale UI-Konzept (Rohentwurf)
+
+Das Design sollte einen schwarzen Hintergrund mit weißem oder rotem Text (Dunkelkammer-tauglich) verwenden. Alle interaktiven Schaltflächen müssen groß genug für eine sichere Bedienung sein.
+1. Seitenstruktur (gemäß UI_Map.h)
+
+Die Seiten-IDs müssen exakt der Reihenfolge in der Software entsprechen:
+
+    Page 0 (Boot): Einfacher Text "Dukatimer v0.5 Booting...".
+
+    Page 1 (Main/BW): Anzeige von time_bw und grade_bw. Buttons für Start, Safelight und Focus.
+
+    Page 2 (SG): Anzeige des Zonen-Histogramms (OBJ_SG_HIST) und der aktuellen Phase (OBJ_SG_PHASE).
+
+    Page 3 (Burn): Anzeige der EV-Zusatzzeit und Gradation.
+
+    Page 4 (Calibration): Schritt-für-Schritt Anweisungen für den Stouffer-Keil.
+
+    Page 5 (Teststrip): Konfiguration der Streifenanzahl und EV-Schritte.
+
+    Page 6 (Wizard/Densitometer): Anzeige von Lux-Werten und berechneter Dichte.
+
+    Page 7 (Menu/Setup): Liste der Systemparameter.
+
+    Page 8 (Lock): Vollflächiger Warnhinweis "BELICHTUNG LÄUFT".
+
+2. Zentrale Steuerobjekte (Nomenklatur-Check)
+
+Die Namen der Komponenten im Nextion-Editor müssen zwingend mit den Definitionen in HW_Display.cpp übereinstimmen:
+
+    Textfelder: tTime, tGrade, tPhase, tHist (für das Histogramm-Array).
+
+    Variablen/Zahlen: nScr (für Screen-Status).
+
+II. Schritt-für-Schritt Anleitung zur Erstellung
+Schritt 1: Projekt-Setup im Nextion Editor
+
+    Öffnen Sie den Nextion Editor.
+
+    Neues Projekt erstellen: Wählen Sie Ihr Display-Modell und die Ausrichtung (Querformat).
+
+    Wichtig: Stellen Sie unter "Character Encoding" den Zeichensatz ein, der auch im ESP32 verwendet wird (meist ASCII/ISO-8859-1).
+
+Schritt 2: Seiten anlegen
+
+Erstellen Sie 9 Seiten in der oben genannten Reihenfolge (ID 0 bis 8). Die IDs sind entscheidend, da der Befehl page X vom ESP32 gesendet wird.
+Schritt 3: Funktionale Platzhalter einfügen (Beispiel Page 1: Main)
+
+    Fügen Sie ein Textfeld für die Zeit ein. Name: tTime.
+
+    Fügen Sie ein Textfeld für die Gradation ein. Name: tGrade.
+
+    Erstellen Sie Buttons für die Steuerung.
+
+    Event-Programmierung: Jeder Button benötigt im "Touch Release Event" den Befehl printh 54 45 58 54 (für den Header "TEXT") gefolgt von der spezifischen Event-ID, z.B. main_start.
+
+        Hinweis: Der ESP32 erwartet Strings wie main_start, main_safe oder main_focus.
+
+Schritt 4: Das Histogramm (Page 2: SG)
+
+    Platzieren Sie ein Textfeld namens tHist.
+
+    Die Software sendet hier einen String mit 11 Komma-getrennten Werten (z.B. "0,20,40..."). Für den Test reicht es, diesen String als Text anzuzeigen, um die Messwerte der Sonde zu validieren.
+
+Schritt 5: Globale Events und Kommunikation
+
+    Stellen Sie sicher, dass die Baudrate im ersten Frame (Preinitialize der Page 0) auf den im ESP32 definierten Wert gesetzt wird (meist bauds=115200).
+
+    Aktivieren Sie "Send Component ID" für alle interaktiven Elemente, falls Sie die Klick-Events über ID-Nummern statt über Strings auswerten wollen (Strings werden jedoch vom aktuellen HW_Display.cpp bevorzugt).
+
+III. Test der Hard- und Software-Schnittstelle
+
+Sobald das HMI-Grundgerüst auf das Display geladen ist, können Sie folgende Tests durchführen:
+
+    Boot-Check: Zeigt das Display nach dem Einschalten des S3 automatisch Page 1 an?.
+
+    Input-Check: Löst ein Druck auf den (virtuellen) Start-Button am Display die Belichtung am S3 aus?.
+
+    Data-Check: Ändern sich die Werte tTime und tGrade auf dem Display, wenn Sie an den physischen Encodern 1 und 3 drehen?.
+
+Soll ich Ihnen für einen der Modi (z.B. den Densitometer-Wizard) das exakte Button-Layout und die zugehörigen Befehlsketten detailliert auflisten?
+Du hast gesagt
+
+erstelle mir übersicht für page1: inkl. variablen und benennung der buttons, sowie detailierten print befehlen pro button
+Gemini hat gesagt
+
+Hier ist die detaillierte Übersicht für Page 1 (Main / BW-Modus) des Nextion-Displays. Diese Konfiguration stellt sicher, dass die Kommunikation zwischen dem Nextion-Editor und dem ESP32-S3 gemäß dem vorhandenen Code funktioniert.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page1 (muss ID 1 haben).
+
+    Hintergrund: Schwarz (Dunkelkammer-Modus).
+
+2. Anzeige-Variablen (Vom S3 zum Nextion)
+
+Diese Objekte müssen im Nextion-Editor angelegt werden, damit der S3 die aktuellen Werte anzeigen kann.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format
+Text	tTime	Belichtungszeit / Dosis	z. B. "12.5s" oder "10.0d"
+Text	tGrade	Gradationswert	z. B. "2.5"
+Variable / Number	nScr	Screen-Status (Dimming)	0 = Normal, 1 = Dunkel
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Jeder Button muss im Nextion-Editor unter "Touch Release Event" programmiert werden. Damit der ESP32 das Event erkennt, wird zuerst der Header TEXT (Hex: 54 45 58 54) gesendet, gefolgt vom spezifischen String-Befehl.
+Button Funktion	Empfohlener Name	String-Event (Code)
+Belichtung Start/Stopp	bStart	main_start
+Safelight (Rotlicht)	bSafe	main_safe
+Fokuslicht (Weiß)	bFocus	main_focus
+Display-Dunkelschaltung	bScreen	main_screen
+Densitometer aufrufen	bDens	main_dens
+Messwert Übernehmen/OK	bApply	main_apply
+4. Detaillierte Print-Befehle pro Button
+
+Kopieren Sie diese Befehle exakt in das Feld "Touch Release Event" des jeweiligen Buttons im Nextion Editor.
+Button: START / STOP
+Code-Snippet
+
+printh 54 45 58 54
+print "main_start"
+printh ff ff ff
+
+Button: SAFELIGHT
+Code-Snippet
+
+printh 54 45 58 54
+print "main_safe"
+printh ff ff ff
+
+Button: FOCUS
+Code-Snippet
+
+printh 54 45 58 54
+print "main_focus"
+printh ff ff ff
+
+Button: SCREEN (Dunkelmodus)
+Code-Snippet
+
+printh 54 45 58 54
+print "main_screen"
+printh ff ff ff
+
+Button: DENSITOMETER
+Code-Snippet
+
+printh 54 45 58 54
+print "main_dens"
+printh ff ff ff
+
+Button: APPLY (Bestätigen)
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Wichtige Hinweise für die Integration:
+
+    Header: Das printh 54 45 58 54 am Anfang ist zwingend erforderlich, da der DisplayManager im S3 diesen Präfix nutzt, um eintreffende Daten als Text-Event zu identifizieren.
+
+    Abschluss: Das printh ff ff ff signalisiert dem Nextion das Ende der Befehlskette (Standard-Terminator).
+
+    Case Sensitivity: Die Befehle in den Anführungszeichen (z. B. "main_start") müssen exakt kleingeschrieben werden, wie in der UI_Map.h definiert.
+
+Du hast gesagt
+
+erstelle page2
+Gemini hat gesagt
+
+Hier ist die detaillierte Übersicht für Page 2 (Splitgrade / SG-Modus) des Nextion-Displays. Diese Seite ist technisch anspruchsvoller, da sie das Zonen-Histogramm visualisiert, das das Herzstück der Splitgrade-Messung darstellt.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page2 (muss im Nextion Editor zwingend die ID 2 haben).
+
+    Hintergrund: Schwarz (Dunkelkammer-tauglich).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Diese Objekte müssen im Nextion Editor angelegt werden, damit der S3 die Messdaten und den Systemstatus visualisieren kann.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format / Logik
+Text	tPhase	Aktueller SG-Status	"SOFT READY", "SOFT RUN", "HARD READY", "HARD RUN".
+Text	tHist	Zonen-Histogramm	String mit 11 Komma-getrennten Werten (z.B. "0,0,20,80,40,0,0,0,0,0,0").
+Number	nZone	Aktueller Zonen-Marker	Wert 0–10 (Position des Cursors im Histogramm).
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons auf dieser Seite steuern den spezifischen Splitgrade-Workflow: Messen, Belichten und Verwerfen.
+Button Funktion	Name	String-Event (Code)	Interne Aktion im S3
+Messung starten	bMeasure	sg_measure	Startet die spektrale Mess-Sequenz (G0 -> G5).
+Belichtung starten	bStart	sg_start	Startet die sequentielle Belichtung (Soft dann Hard).
+Mess-Session Reset	bReset	sg_reset	Löscht das aktuelle Histogramm und setzt die Session zurück.
+4. Detaillierte Print-Befehle pro Button
+
+Geben Sie diese Befehle im Nextion Editor unter "Touch Release Event" ein. Der ESP32-S3 filtert auf den Header TEXT (Hex: 54 45 58 54).
+Button: MESSUNG STARTEN (Trigger für die Sonde)
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_measure"
+printh ff ff ff
+
+Button: BELICHTUNG STARTEN (Splitgrade-Sequenz)
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_start"
+printh ff ff ff
+
+Button: SESSION RESET (Histogramm leeren)
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Technische Hinweise für den Test:
+
+    Histogramm-Anzeige: Das Feld tHist ist im Testbetrieb ein reines Textfeld. Der ESP32 sendet dort Rohdaten wie "20,40,0...". Für eine grafische Balkenanzeige müsste im Nextion Editor später ein "Waveform"- oder "Progressbar"-Array programmiert werden.
+
+    Phase-Feedback: Achten Sie auf tPhase. Das System wechselt nach der ersten Belichtung (Soft) automatisch in den Status "HARD READY".
+
+    Zonen-Marker: nZone wird vom S3 gesendet, wenn Sie die Spot-Messung durchführen, um zu zeigen, in welcher Zone (0 bis X) der letzte Messpunkt gelandet ist.
+
+Du hast gesagt
+
+page 3
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 3, die gemäß deinem zuvor erstellten Konzept den Burn-Modus (Nachbelichten) behandelt. Diese Seite dient dazu, die Hardware-Steuerung (Relais-Zeiten) für additive Belichtungen zu testen.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page3 (Im Nextion Editor als ID 3 anlegen, um deiner Test-Sequenz zu entsprechen).
+
+    Hinweis: In der Datei UI_Map.h ist für den Burn-Modus eigentlich die ID "6" vorgesehen. Für dein kurzfristiges Test-UI behalten wir jedoch ID 3 bei, damit die Navigation konsistent bleibt.
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Diese Felder zeigen die Parameter an, die du zuvor am Hauptgerät (S3) eingestellt hast.
+Objekt-Typ	Name (Objname)	Funktion	Erwartete Daten
+Text	tTime	Berechnete Burn-Zeit	z. B. "4.2s"
+Text	tGrade	Burn-Gradation	z. B. "4.5"
+Text	tEv	Belichtungskorrektur	z. B. "+1/3 EV"
+
+    Software-Hinweis: Im aktuellen Stand von HW_Display.cpp werden tTime und tGrade primär im BW-Modus aktualisiert. Für den Burn-Modus-Test musst du eventuell sicherstellen, dass die updateNextionUI-Funktion auch im Zustand MODE_BURN diese Felder beschreibt.
+
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons nutzen die vorhandenen Event-Trigger des S3-Systems.
+Button Funktion	Name	String-Event (Code)	Aktion
+Burn Ausführen	bStart	main_start	Triggert die Belichtung (Relais an).
+Abbruch / Zurück	bBack	sg_reset	Bricht den Vorgang ab oder setzt die Session zurück.
+4. Detaillierte Print-Befehle pro Button
+
+Geben Sie diese Befehle im Nextion Editor unter "Touch Release Event" ein.
+Button: BURN START (Relais-Test)
+
+Dieser Befehl injiziert ein EVT_START_PRESSED in das System, was die Belichtung für die berechnete Burn-Zeit startet.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_start"
+printh ff ff ff
+
+Button: BURN BACK (Abbruch)
+
+Dieser Befehl nutzt die Reset-Logik, um eine aktive "Armed"-Phase zu verlassen.
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 3:
+
+    Seite anlegen: Erstelle eine neue Seite mit dem Namen page3 und stelle sicher, dass sie die ID 3 erhält.
+
+    Hintergrund: Färbe den Hintergrund Schwarz (bco=0), um die Dunkelkammer-Tauglichkeit zu wahren.
+
+    Textelemente:
+
+        Erstelle ein Textfeld tTime für die Sekundenanzeige.
+
+        Erstelle ein Textfeld tGrade für die Gradationsanzeige.
+
+        Erstelle ein Textfeld tEv für die EV-Anzeige (Wichtig für die visuelle Kontrolle der Encoder-Bewegung am S3).
+
+    Buttons: Zeichne zwei große Buttons am unteren Rand.
+
+        Beschrifte einen mit "BURN FIRE" (Event: main_start).
+
+        Beschrifte den anderen mit "CANCEL" (Event: sg_reset).
+
+    Kompilieren & Laden: Übertrage das Projekt auf das Nextion.
+
+    Funktionstest: Wechsel am Dukatimer (S3) in den Burn-Modus. Das Display sollte nun auf Page 3 springen (sofern die ID-Logik im S3 auf 3 angepasst wurde). Ein Druck auf "BURN FIRE" muss das Metronom und die Belichtung starten.
+
+Du hast gesagt
+
+erstelle page4
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 4, die den Kalibrierungs-Modus (Modus 5 - Stouffer-Workflow) behandelt. Diese Seite ist essenziell, um die physikalischen Eigenschaften deines Fotopapiers (ISO-P und ISO-R) mathematisch korrekt in der PaperBank zu erfassen.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page4 (muss im Nextion Editor zwingend die ID 4 haben, passend zu PAGE_CALIB in der UI_Map.h).
+
+    Hintergrund: Schwarz (bco=0).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Da der Kalibrierungs-Assistent (Wizard) den Nutzer durch mehrere Schritte führt, benötigen wir Felder für dynamische Anweisungen und Werte.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format
+Text	tStatus	Aktueller Schritt des Assistenten	z. B. "Phase 1: Basis-Licht"
+Text	tInstruction	Handlungsanweisung für den User	z. B. "Sonde auf Grundbrett!"
+Text	tStep	Aktuelle Stouffer-Stufe (Eingabe)	z. B. "Stufe: 4"
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons steuern das Voranschreiten im Workflow und das Bestätigen der visuell ermittelten Graukeil-Stufen.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Messen / Bestätigen	bApply	main_apply	Triggert Messung oder übernimmt Stufe.
+Abbruch	bBack	sg_reset	Verlässt den Kalibrierungs-Modus.
+4. Detaillierte Print-Befehle pro Button
+
+Geben Sie diese Befehle im Nextion Editor unter "Touch Release Event" ein.
+Button: MESSEN / WEITER (Bestätigen)
+
+Dieser Button wird genutzt, um die Referenzmessung auszulösen und später die am Papier abgelesenen Stufen (z. B. Stufe 4 für Weiß) einzuloggen.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Button: ABBRUCH
+
+Beendet den Assistenten vorzeitig, ohne Daten in die PaperBank zu schreiben.
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Konzept für den Test-Workflow auf Page 4:
+
+    Phase 1 (Referenz): Der S3 sendet an tStatus "Messung" und an tInstruction "Kein Negativ!". Du drückst bApply. Der S3 misst LuxG0​ und LuxG5​.
+
+    Phase 2 (Exposition): Der S3 zeigt an "Belichtung". Du legst den Stouffer-Keil auf das Papier und drückst die physikalische Start-Taste am Gerät.
+
+    Phase 3 (Eingabe): Nach der Entwicklung zeigt tStatus "Auswertung Grün". Mit dem Encoder am S3 stellst du die Stufe ein (wird in tStep angezeigt) und bestätigst mit bApply auf dem Nextion.
+
+    Abschluss: Der S3 berechnet die absoluten Dosen und speichert das Profil.
+
+Tipp für die Anzeige: Da das Nextion noch nicht final programmiert ist, ist es hilfreich, die Textfelder tStatus und tInstruction großzügig zu dimensionieren (mindestens 16-20 Zeichen Breite), damit die Anweisungen des S3 vollständig lesbar sind.
+Du hast gesagt
+
+page5
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 5, die den Probestreifen-Modus (Modus 3 - Test Strip) behandelt. Dieser Modus ist kritisch für die Ermittlung der korrekten Basisbelichtung durch eine sequentielle Belichtungsreihe.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page5 (Im Nextion Editor als ID 5 anlegen, passend zum PAGE_TESTSTRIP Slot).
+
+    Hintergrund: Schwarz (bco=0).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Der Teststreifen-Modus durchläuft drei Phasen (Setup, Ausführung, Auswertung), weshalb die Felder je nach Status unterschiedliche Informationen zeigen.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format / Inhalt
+Text	tStatus	Aktuelle Phase	"SETUP", "EXECUTION" oder "EVALUATION".
+Text	tInfo1	Konfigurations-Details	z. B. "Step: 1/3 EV" oder "Strip 2 / 5".
+Text	tInfo2	Zeit / Resultat	Berechnete Zeit des aktuellen Streifens.
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons nutzen die für die Testphase definierten Kommunikations-Events.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Start / Nächster	bStart	main_start	Startet die nächste Teilbelichtung der Reihe.
+Bestätigen / OK	bApply	main_apply	Loggt Parameter ein oder übernimmt gewähltes Resultat.
+Abbruch	bBack	sg_reset	Bricht die Serie ab oder verlässt den Modus.
+4. Detaillierte Print-Befehle pro Button
+Button: NEXT STRIP / START
+
+Wird in Phase 2 verwendet, um jeden einzelnen Belichtungsschritt der Reihe manuell auszulösen.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_start"
+printh ff ff ff
+
+Button: CONFIRM / APPLY
+
+Dient im Setup zum Einloggen der Streifenanzahl und am Ende zur Übernahme des gewählten Streifens in den Haupt-Timer (Closed Loop).
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Button: ABORT / CANCEL
+
+Bricht die laufende Serie sofort ab (Not-Aus) oder schließt das Overlay ohne Änderungen.
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 5:
+
+    Seite erstellen: Erstellen Sie page5 (ID 5).
+
+    Status-Anzeige: Platzieren Sie das Textfeld tStatus. In Phase 1 zeigt es die Konfiguration an, in Phase 2 den Fortschritt.
+
+    Parameter-Anzeige:
+
+        tInfo1 sollte groß genug sein, um EV-Schritte wie "1/6 EV" oder den Fortschrittsbalken-Text anzuzeigen.
+
+        tInfo2 zeigt die für den jeweiligen Streifen errechneten absoluten Sekunden an.
+
+    Interaktion:
+
+        Erstellen Sie den Button "START NEXT" (Event: main_start).
+
+        Erstellen Sie den Button "CONFIRM" (Event: main_apply).
+
+        Erstellen Sie den Button "ABORT" (Event: sg_reset).
+
+    Test-Ablauf:
+
+        Stellen Sie am S3 (Encoder 1 & 2) die Parameter ein.
+
+        Prüfen Sie, ob tInfo1 auf dem Nextion die Änderungen spiegelt.
+
+        Drücken Sie bApply zum Starten.
+
+        Verwenden Sie bStart für jeden Belichtungsschritt und prüfen Sie das akustische Feedback am S3.
+
+Du hast gesagt
+
+page6
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 6, die den Densitometer-Modus (Modus 7) behandelt. Dieser Modus dient zur Film-Optimierung, Sensor-Linearisierung und Bestimmung des Dichteumfangs von Negativen.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page6 (Im Nextion Editor als ID 6 anlegen, passend zu PAGE_WIZARD in der UI_Map.h).
+
+    Hintergrund: Schwarz (bco=0).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Diese Felder visualisieren die Rohdaten des Sensors und das mathematische Ergebnis der Dichteberechnung.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format
+Text	tStatus	Handlungsanweisung	"Referenz messen" oder "Negativ messen".
+Text	tLux	Aktueller Lichtwert	z. B. "Lux: 450.2".
+Text	tDens	Berechnete Dichte (D)	z. B. "D: 1.25".
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons steuern den zweistufigen Workflow: Nullabgleich (Referenz) und eigentliche Messung.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Referenz (Null)	bRef	main_start	Speichert LuxRef​ (Licht ohne Film).
+Messung (Dichte)	bMeas	main_apply	Misst durch den Film und berechnet D.
+Beenden	bBack	sg_reset	Kehrt zum Hauptmenü zurück.
+4. Detaillierte Print-Befehle pro Button
+Button: REFERENZ (Ohne Film)
+
+Setzt den Basiswert für die Berechnung der optischen Dichte.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_start"
+printh ff ff ff
+
+Button: MESSUNG (Durch das Negativ)
+
+Triggert die Messung und zeigt sofort die Dichte D an.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Button: EXIT
+
+Beendet den Densitometer-Modus.
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 6:
+
+    Seite anlegen: Erstellen Sie page6 (ID 6).
+
+    Beschriftung: Platzieren Sie das Textfeld tStatus zentral oben, um Anweisungen wie "Bühne leer machen" anzuzeigen.
+
+    Datenanzeige:
+
+        Erstellen Sie tLux für die Echtzeitanzeige des Sensors. Dies hilft zu prüfen, ob die Sonde korrekt unter der Lichtquelle liegt.
+
+        Erstellen Sie tDens in einer größeren Schriftart, da dies der primäre Ausgabewert für den Anwender ist.
+
+    Buttons programmieren:
+
+        "REF" Button: Programmieren Sie das main_start Event. Der S3 quittiert den Nullabgleich meist mit einem Beep.
+
+        "MEAS" Button: Programmieren Sie das main_apply Event.
+
+    Test-Workflow:
+
+        Wechseln Sie am Hauptgerät in den Densitometer-Modus.
+
+        Drücken Sie auf dem Nextion bRef (Sonde misst leere Bühne).
+
+        Legen Sie ein Negativ auf die Sonde und drücken Sie bMeas.
+
+        Prüfen Sie, ob der berechnete Wert in tDens plausibel ist (z.B. D=0.30 für eine Blende Lichtverlust).
+
+Möchten Sie als Nächstes die Seite für das System-Setup (Page 7) mit der Liste der Hardware-Parameter erstellen?
+Du hast gesagt
+
+page7
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 7, die das System-Setup & Konfiguration (Modus 8) behandelt. Diese Seite ist für die Hardware-Inbetriebnahme entscheidend, da hier PWM-Grenzwerte, Audio-Optionen und Systemeinstellungen kalibriert werden.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page7 (Im Nextion Editor als ID 7 anlegen, passend zu PAGE_MENU in der UI_Map.h).
+
+    Hintergrund: Schwarz (bco=0).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Das Setup nutzt eine flache Hierarchie. Für das Test-UI reichen drei Textfelder aus, um durch die Kategorien und Werte zu navigieren.
+Objekt-Typ	Name (Objname)	Funktion	Beispielinhalt
+Text	tCat	Aktuelle Kategorie	"1. Beleuchtung"
+Text	tItem	Parameter-Name	"Safelight Max PWM"
+Text	tVal	Aktueller Wert	"80%" oder "An"
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Da die Steuerung primär über die Encoder erfolgt, dienen die Buttons hier als funktionaler Touch-Fallback.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Enter / Edit	bEnter	main_apply	Wechselt in den Edit-State / Speichert Wert.
+Abbruch / Zurück	bBack	sg_reset	Verlässt Menü / Verwirft Änderung (Panik-Taste).
+Hoch / Plus	bUp	main_focus	Simuliert Encoder-Drehung (Navigation/Wert erhöhen).
+Runter / Minus	bDown	main_safe	Simuliert Encoder-Drehung (Navigation/Wert verringern).
+
+Hinweis: Da die spezifischen Setup-Events im aktuellen HW_Display.cpp noch nicht vollständig gemappt sind, nutzen wir hier vorhandene Standard-Events als Brücke.
+4. Detaillierte Print-Befehle pro Button
+Button: ENTER / SAVE
+
+Wählt einen Parameter aus (Wert blinkt im S3) oder speichert die Änderung.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Button: BACK / ESCAPE (Panik-Taste)
+
+Bricht das Editieren ab oder springt eine Menüebene nach oben.
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Button: UP / PLUS
+
+Navigiert durch die Liste oder erhöht im Edit-State den Wert.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_focus"
+printh ff ff ff
+
+Button: DOWN / MINUS
+
+Navigiert abwärts oder verringert den Wert.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_safe"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 7:
+
+    Seite anlegen: Erstellen Sie page7 (ID 7) im Nextion Editor.
+
+    Layout: Platzieren Sie tCat ganz oben als Header. Darunter tItem (links) und tVal (rechts daneben).
+
+    Wichtige Kategorien für den Test einplanen:
+
+        Beleuchtung: Safelight PWM (0-100%).
+
+        Audio: Beep Volume, Metronome (An/Aus).
+
+        PaperBank: Aktives Papier auswählen.
+
+    Test-Ablauf:
+
+        Wechseln Sie am S3 mit dem Modus-Encoder in das System Setup.
+
+        Prüfen Sie, ob tItem den ersten Parameter (z.B. "Safelight PWM") anzeigt.
+
+        Drücken Sie bEnter auf dem Nextion. Das Gerät sollte in den Edit-State wechseln (akustisches Signal oder Blinken am Gerät).
+
+        Verwenden Sie bUp / bDown, um den Wert zu ändern, und beobachten Sie, ob sich die Helligkeit der Safelight-LEDs am Gerät unmittelbar ändert (Echtzeit-Feedback).
+
+        Drücken Sie erneut bEnter zum Speichern.
+
+Damit ist das Grundgerüst für die Test-UI (Page 0 bis 7) komplett. Sie können nun mit der Programmierung der Nextion-Hardware und der Integration der Papierprofile beginnen.
+Du hast gesagt
+
+page8
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 8, die den Lock-Modus (Sicherheits-Sperre während der Belichtung) behandelt. Diese Seite ist funktional entscheidend, um Fehlbedienungen während einer laufenden Belichtung auszuschließen und den Fortschritt der „Root Cause Engine“ zu visualisieren.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page8 (Muss im Nextion Editor zwingend die ID 8 haben, passend zu PAGE_LOCK in der UI_Map.h).
+
+    Hintergrund: Vollflächig Rot oder Schwarz mit großem rotem Warnhinweis (Gefahrenanzeige für Fogging).
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Während der Belichtung sendet der S3 kontinuierlich Status-Updates, um den Fortschritt anzuzeigen.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format
+Text	tStatus	Warnmeldung	"BELICHTUNG LÄUFT" oder "BURN AKTIV".
+Text	tTime	Verbleibende Restzeit	z. B. "9.4s".
+Progressbar	jProgress	Grafischer Fortschritt	Wert 0–100 % (entspricht dem Belichtungsfortschritt).
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+In der „eisernen Logik-Regel“ des Dukatimers sollten kritische Aktionen während der Belichtung am Touch-Display minimiert werden, um Erschütterungen zu vermeiden. Dennoch ist ein funktionaler Not-Halt sinnvoll.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Not-Halt / Abbr.	bStop	main_start	Stoppt die laufende Belichtung sofort (Graceful Stop).
+4. Detaillierte Print-Befehle pro Button
+Button: NOT-HALT (Emergency Stop)
+
+Dieser Button nutzt das main_start Event, da die Software so programmiert ist, dass ein Start-Event während einer laufenden Belichtung diese sofort abbricht.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_start"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 8:
+
+    Seite anlegen: Erstellen Sie page8 (ID 8) im Nextion Editor.
+
+    Visuelle Warnung:
+
+        Erstellen Sie ein großes Textfeld tStatus im oberen Drittel.
+
+        Setzen Sie die Textfarbe auf Rot und schreiben Sie als Standardwert "!!! ACHTUNG !!!".
+
+    Fortschrittsanzeige:
+
+        Platzieren Sie das Textfeld tTime zentral in der Mitte (große Schriftart), um die herunterlaufenden Sekunden anzuzeigen.
+
+        Fügen Sie darunter eine Progressbar jProgress ein (Eigenschaft v wird vom S3 gesteuert).
+
+    Sicherheits-Button:
+
+        Platzieren Sie einen großen Button bStop am unteren Rand.
+
+        Beschriften Sie ihn mit "ABBRUCH".
+
+    Test-Workflow:
+
+        Starten Sie eine Belichtung (BW oder SG) am Hauptgerät (S3).
+
+        Prüfen Sie, ob der S3 automatisch auf Page 8 umschaltet (Logik in HW_Display.cpp).
+
+        Beobachten Sie, ob tTime und jProgress synchron mit dem akustischen Ticken des Metronoms aktualisiert werden.
+
+        Drücken Sie bStop auf dem Nextion und prüfen Sie, ob die Belichtung sofort endet und das Gerät in den sicheren Idle-Zustand zurückkehrt.
+
+Zusammenfassung der Test-UI:
+Damit haben Sie nun alle relevanten Seiten (0 bis 8) für das funktionale Test-HMI definiert. Dieses Setup erlaubt es Ihnen, die gesamte Kette vom Messen mit der Probe über die Papier-Parametrierung bis hin zur gesteuerten Belichtung ohne grafischen Schnickschnack zu validieren.
+Du hast gesagt
+
+page9
+Gemini hat gesagt
+
+Hier ist die Übersicht für Page 9, die gemäß der Architektur der „Root Cause Engine“ als Wireless & Bridge Diagnostics Seite fungiert. Da Modus 9 im Pflichtenheft das Handbedienteil (Wireless Probe) ist, dient diese Seite am Hauptgerät dazu, die Funkverbindung und den Datendurchsatz der ESP-NOW-Strecke zu überwachen sowie den USB-Bridge-Modus zu aktivieren.
+1. Seiten-Eigenschaften
+
+    Seiten-Name: page9 (Im Nextion Editor als ID 9 anlegen).
+
+    Hintergrund: Schwarz (bco=0).
+
+    Zweck: Echtzeit-Diagnose der Funksonde und System-Wartung.
+
+2. Anzeige-Objekte (Vom S3 zum Nextion)
+
+Diese Felder visualisieren den Status der Kommunikation und die Rohdaten, die vom ESP32-C6 (Sonde) empfangen werden.
+Objekt-Typ	Name (Objname)	Funktion	Erwartetes Format
+Text	tStatus	Verbindungsstatus	"CONNECTED" oder "DISCONNECTED".
+Text	tLuxG0	Rohwert Grün-Kanal	z. B. "G0: 124.5 lx".
+Text	tLuxG5	Rohwert Blau-Kanal	z. B. "G5: 88.2 lx".
+Text	tDiag	Paket-Statistik	"Lost: 0 / OK: 1240".
+3. Button-Konfiguration (Vom Nextion zum S3)
+
+Die Buttons auf dieser Seite steuern die Systemmodi für Wartung und Funk-Pairing.
+Button Funktion	Name	String-Event (Code)	Aktion im S3
+Nextion Upload	bBridge	main_bridge	Startet den MODE_BRIDGE für Firmware-Updates.
+Haptik Test	bVib	main_apply	Sendet einen Test-Vibrationsbefehl an die Sonde.
+Zurück	bBack	sg_reset	Kehrt zum Hauptbildschirm zurück.
+4. Detaillierte Print-Befehle pro Button
+Button: NEXTION UPLOAD (Bridge Mode)
+
+Dieser Button versetzt den ESP32-S3 in den Bridge-Modus, um ein neues HMI-Projekt vom PC direkt durch den S3 auf das Nextion-Display zu laden.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_bridge"
+printh ff ff ff
+
+Button: HAPTIK TEST (Vibration Trigger)
+
+Nutzt das Standard-Bestätigungsevent, um ein Datenpaket mit haptic_feedback = 1 an die Sonde zu senden.
+Code-Snippet
+
+printh 54 45 58 54
+print "main_apply"
+printh ff ff ff
+
+Button: BACK (Home)
+Code-Snippet
+
+printh 54 45 58 54
+print "sg_reset"
+printh ff ff ff
+
+Schritt-für-Schritt Anleitung für Page 9:
+
+    Seite erstellen: Erstellen Sie page9 (ID 9).
+
+    Diagnose-Layout:
+
+        Platzieren Sie tStatus ganz oben. Verwenden Sie im Editor eine bedingte Formatierung (Grün für Verbunden, Rot für Getrennt), falls möglich.
+
+        Erstellen Sie zwei große Textfelder für tLuxG0 und tLuxG5. Dies ist beim Einrichten des Vergrößerers extrem hilfreich, um die Sensor-Ausrichtung zu prüfen.
+
+    Statistik-Feld: Das Feld tDiag sollte die Variable totalDroppedPackets anzeigen, um die Funkstabilität in der Dunkelkammer zu bewerten.
+
+    Wartungs-Button: Der bBridge Button ist essentiell für zukünftige UI-Updates.
+
+    Funktionstest:
+
+        Schalten Sie die Funksonde (C6) ein.
+
+        Prüfen Sie, ob tStatus auf "CONNECTED" springt.
+
+        Bewegen Sie die Sonde unter das Licht und beobachten Sie die Live-Werte in tLuxG0/G5.
+
+        Drücken Sie bVib und prüfen Sie, ob die Sonde kurz vibriert (Haptic Heartbeat).
+
+Damit ist Ihr Nextion-HMI-Konzept (Seiten 0 bis 9) vollständig funktional und bereit für den ersten Beta-Test der gesamten Systemarchitektur.
+
+Basierend auf der vorgeschlagenen Nextion-UI-Struktur und den Anforderungen für die Hardware- und Software-Tests müssen die folgenden Dateien im Projekt ergänzt oder angepasst werden, um die Kommunikation zwischen dem ESP32-S3 und dem Display zu vervollständigen:
+1. Dukatimer v0.3/include/UI_Map.h
+
+    Zweck: Diese Datei dient als zentrale Definitionsstelle für die Kommunikation mit dem Nextion-Display.
+
+    Änderungen:
+
+        Sicherstellen, dass die Page-IDs (z. B. PAGE_MAIN, PAGE_SG, PAGE_CALIB) exakt mit den IDs im Nextion Editor (0 bis 9) übereinstimmen.
+
+        Ergänzen der Objekt-Namen für die neuen Textfelder (z. B. tTime, tGrade, tPhase, tHist, tCat, tVal).
+
+        Definieren der Event-Strings (z. B. main_bridge, sg_measure, sg_reset), damit diese im gesamten Code konsistent verwendet werden.
+
+2. Dukatimer v0.3/src/HW_Display.cpp
+
+    Zweck: Dies ist der primäre UI-Controller, der Daten an das Nextion sendet und Klick-Events vom Display empfängt.
+
+    Änderungen:
+
+        handleNextionEvent / handleNextionCommand: Diese Funktionen müssen um die neuen Befehle erweitert werden (z. B. main_bridge, sg_measure, sg_reset), um die entsprechenden virtuellen Buttons in die xInputQueue zu injizieren.
+
+        updateNextionUI: Die Logik muss so erweitert werden, dass sie je nach currentMode Daten an die spezifischen Felder der neuen Seiten sendet (z. B. Histogramm-Daten an tHist auf Page 2 oder Dichtewerte an tDens auf Page 6).
+
+        triggerInfo: Ergänzung der LCD-Ausgabe, damit auch bei nicht programmiertem Nextion wichtige Statusinformationen (wie die Anzahl der gemessenen Spots) sichtbar sind.
+
+3. Dukatimer v0.3/src/Logic_Timer.cpp
+
+    Zweck: Verarbeitet die Eingabe-Events (InputEvent) und steuert die Belichtungsmodi.
+
+    Änderungen:
+
+        Sicherstellen, dass Ereignisse wie EVT_ENTER_PRESSED (ausgelöst durch den main_apply Button) in jedem Modus (Kalibrierung, Densitometer, Setup) die korrekte Aktion auslösen.
+
+        Anpassung der Modus-Wahl im EVT_ENC_MODE-Zweig, um einen sauberen Seitenwechsel am Nextion zu erzwingen, wenn der Modus am Gerät gewechselt wird.
+
+4. Dukatimer v0.3/src/Logic_Measurement.cpp
+
+    Zweck: Handhabt die Mess-Sessions und das Histogramm.
+
+    Änderungen:
+
+        Erweiterung der Funktionen startMeteringSession und finalizeMeteringSession, um sicherzustellen, dass die über das Nextion (sg_measure) gestarteten Messungen korrekt verarbeitet und die Ergebnisse für die Anzeige auf dem Display bereitgestellt werden.
+
+5. Dukatimer v0.3/src/HW_Wireless.cpp
+
+    Zweck: Steuert die Kommunikation mit der Funksonde und das Rendering auf deren OLED.
+
+    Änderungen:
+
+        Harmonisierung der Anzeige-Texte zwischen der Funksonde und dem Nextion, damit z. B. tPhase am Display und der Header am Handgerät identische Informationen liefern.
+
+6. Dukatimer v0.3/src/main.cpp
+
+    Zweck: Initialisierung des Systems und der Kommunikations-Tasks.
+
+    Änderungen:
+
+        Prüfung der Task-Prioritäten für vTaskIO (Core 0), um sicherzustellen, dass die serielle Kommunikation zum Nextion flüssig läuft und keine Datenpakete verloren gehen, während im Hintergrund Messdaten verarbeitet werden.

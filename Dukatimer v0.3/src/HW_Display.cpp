@@ -1,360 +1,378 @@
 /*
-   HW_Display.cpp - Optimierte Version für Dukatimer v0.3
-   
-   Funktionen:
-   - Steuert Grove RGB LCD (I2C) mit Fehler-Farbcodierung
-   - Steuert Nextion Display (UART) via DisplayManager
-   - Anzeige von Raumtemperatur (BMP280) und LED-Temperatur (DS18B20)
-   - Synchronisiert beide Displays (Overlay, Icons, Werte)
-   - Behandelt Touch-Events gemäß "Entwicklung UI.txt"
+    HW_Display.cpp - UI Controller (Full Beta Integration v0.5.10)
+    
+    Zentrale Zusammenführung der v0.5.8 Logik mit dem funktionalen UI-Konzept.
+    Fix für Befund 1: Vollständige Entkopplung von Core 0 und Core 1 via xInputQueue.
 */
 
 #include <Arduino.h>
 #include <cstring>
+#include <math.h>
 #include "Globals.h"
 #include "Config.h"
 #include "DisplayManager.h"
+#include "UI_Map.h"
+#include "ExposureEngine.h"
+#include "Logic_Measurement.h"
+#include "Logic_Math.h"
 
-extern void beepClick();
+// Shadow-Speicher Definition (v0.5.8 Erhalt)
+LCDShadow lcdShadow = {"", "", 0, false}; 
+static uint8_t lastR = 255, lastG = 255, lastB = 255;
 
-// =============================================================================
-// KRITISCH: Direktes Starten/Stoppen des Timers über Nextion-Start-Button
-// =============================================================================
-// Der Start-Button (ID_MAIN_START) ruft jetzt direkt startTimer()/stopTimer auf,
-// statt das Zeichen '#' in den Key-Buffer zu legen. Dadurch wird das Umschalten
-// der EV-Schrittweite (handleIdleInput) nicht mehr fälschlich ausgelöst.
-// Vorteil: Touch-UI verhält sich wie physischer Start-Taster.
-extern unsigned long starttime;
-extern void startTimer();
-extern void stopTimer();
+// Nextion State Tracking
+static int lastBtScr = -1;
+static int lastMode = -1;
+static double lastTimeBW = -1.0;
+static double lastGradeBW = -1.0;
+static bool lastLockPageActive = false;
+static int lastZoneVal = -1;
+static int lastSentZoneVal = -1;
+static String lastZoneHist = "";
+static String lastSgPhase = "";
+static uint8_t prevZoneHistogram[11] = {0};
 
-// =============================================================================
-// KONFIGURATION: NEXTION IDs (Synchron mit Entwicklung UI.txt)
-// =============================================================================
-#define PAGE_MAIN   0
+/**
+ * Helfer: Injiziert ein Event in die Input-Queue.
+ * Stellt sicher, dass die Geschäftslogik auf Core 1 (TaskRealtime) ausgeführt wird.
+ */
+static void injectVirtualButton(InputEventType type) {
+    InputEvent evt;
+    evt.type = type;
+    evt.value = 0;
+    evt.timestamp = millis();
+    xQueueSend(xInputQueue, &evt, 0);
+}
 
-#define ID_MAIN_SW      NEXTION_BTN_SW_ID
-#define ID_MAIN_SG      NEXTION_BTN_SG_ID
-#define ID_MAIN_DENS    NEXTION_BTN_DENS_ID
-#define ID_MAIN_HASH    NEXTION_BTN_HSH_ID
-#define ID_MAIN_START   NEXTION_BTN_STR_ID
-#define ID_MAIN_FOCUS   NEXTION_BTN_FOC_ID
-#define ID_MAIN_SL      NEXTION_BTN_SL_ID
-#define ID_MAIN_MENU    NEXTION_BTN_MNU_ID
-#define ID_MAIN_SCREEN  NEXTION_BTN_SCR_ID
+static const char* stepModeToLabel(StepSize mode) {
+    switch (mode) {
+        case STEP_FULL:  return "1/1";
+        case STEP_HALF:  return "1/2";
+        case STEP_THIRD: return "1/3";
+        case STEP_SIXTH: return "1/6";
+        default:         return "1/3";
+    }
+}
 
-// =============================================================================
-// GLOBALE & STATISCHE VARIABLEN
-// =============================================================================
-static char lastL1[17] = {0};
-static char lastL2[17] = {0};
-static unsigned long hashPressStart = 0;
-static bool lastDimState = false; 
-static char nextionKeyBuf = 0; 
+/**
+ * v0.5.8 Hilfsfunktion: Fügt den EV-Step rechtsbündig in die LCD-Zeile ein.
+ * Verhindert das manuelle Formatieren in jedem triggerInfo-Zweig.
+ */
+static void appendRightAlignedStep(char* line, size_t lineSize) {
+    if (lineSize < 17) return;
+    const char* step = stepModeToLabel(globalStepMode);
+    const size_t stepLen = strlen(step);
+    if (stepLen == 0 || stepLen > 16) return;
+    const size_t stepPos = 16 - stepLen;
+    const size_t maxBaseLen = (stepPos > 0) ? (stepPos - 1) : 0;
 
-char getNextionKey() { 
-    char k = nextionKeyBuf; 
-    nextionKeyBuf = 0; 
-    return k; 
+    char merged[17];
+    memset(merged, ' ', 16);
+    merged[16] = '\0';
+
+    size_t baseLen = strlen(line);
+    if (baseLen > maxBaseLen) baseLen = maxBaseLen;
+    if (baseLen > 0) memcpy(merged, line, baseLen);
+    if (stepPos > 0) merged[stepPos - 1] = ' ';
+    memcpy(merged + stepPos, step, stepLen);
+    memcpy(line, merged, 17);
+}
+
+static bool streq(const char* a, const char* b) {
+    return (strcmp(a, b) == 0);
 }
 
 // =============================================================================
-// INITIALISIERUNG
+// LCD LOGIK (Shadow-Copy & Hardware-I2C)
 // =============================================================================
 
-void initDisplays() {
-  DM_init(); 
-  if (lcdOK) {
-    lcd.setRGB(255, 255, 255);
-    lcd.setCursor(0, 0); 
-    lcd.print("Dukatimer v0.3");
-  }
-  // Kurze Pause für Nextion Boot-Phase
-  delay(500);
+void uiUpdateLCD(const char* l1, const char* l2, uint8_t progress) {
+    if (xSemaphoreTake(xShadowMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        // FIX A4: Hartes Padding mit Leerzeichen, um Geister-Zeichen zu überschreiben
+        memset(lcdShadow.line1, ' ', 16);
+        size_t len1 = strlen(l1);
+        if (len1 > 16) len1 = 16;
+        memcpy(lcdShadow.line1, l1, len1);
+        lcdShadow.line1[16] = '\0';
+
+        memset(lcdShadow.line2, ' ', 16);
+        size_t len2 = strlen(l2);
+        if (len2 > 16) len2 = 16;
+        memcpy(lcdShadow.line2, l2, len2);
+        lcdShadow.line2[16] = '\0';
+
+        lcdShadow.progress = progress;
+        lcdShadow.dirty = true;
+        xSemaphoreGive(xShadowMutex);
+    }
 }
 
-// =============================================================================
-// LCD LOGIK (Inkl. Schalter 13 / Button 9 Logik)
-// =============================================================================
-
-void smartLCD(const char* l1, const char* l2) {
-  if (!lcdOK) return;
-
-  // --- 1. FARB-LOGIK & DUNKELKAMMER-MODUS ---
-  bool isScreenOff = roomLatch || screenOffOverride; 
-  char buf1[17], buf2[17];
-  const char *display1 = l1, *display2 = l2;
-
-  if (isScreenOff) {
-    lcd.setRGB(0, 0, 0); // LCD Backlight AUS
-  }
-  else if (softAbortActive && (millis() < softAbortUntilMs)) {
-    lcd.setRGB(255, 0, 0); // Alarm Rot bei Sensorverlust
-    display1 = "SOFT ABORT";
-    display2 = "SENSOR LOST";
-  } 
-  else if (lastSystemError != ERR_NONE) {
-    lcd.setRGB(255, 0, 0); // Fehler Rot
-  } 
-  else if (starttime != 0 || isMeasuring) {
-    lcd.setRGB(0, 0, 0); // Während Belichtung aus (Dunkelkammer-Schutz)
-  } 
-  else if ((digitalRead(PIN_SW_SAFE) == LOW) || safeLatch) {
-    lcd.setRGB(200, 0, 0); // Rotlicht Modus
-  } 
-  else {
-    lcd.setRGB(255, 0, 0); // Standby Rot
-  }
-
-  // --- 2. HARDWARE UPDATE (16 Zeichen formatieren) ---
-  // Use fixed buffers instead of String concatenation
-  snprintf(buf1, sizeof(buf1), "%-16s", display1 ? display1 : "");
-  snprintf(buf2, sizeof(buf2), "%-16s", display2 ? display2 : "");
-  
-  if (strcmp(lastL1, buf1) != 0) { 
-    lcd.setCursor(0, 0); lcd.print(buf1); 
-    strncpy(lastL1, buf1, 16);
-  }
-  if (strcmp(lastL2, buf2) != 0) { 
-    lcd.setCursor(0, 1); lcd.print(buf2); 
-    strncpy(lastL2, buf2, 16);
-  }
+void processLCDShadow() {
+    if (!lcdShadow.dirty) return;
+    if (xSemaphoreTake(xShadowMutex, 0) == pdTRUE) {
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            lcd.setCursor(0, 0); lcd.print(lcdShadow.line1);
+            lcd.setCursor(0, 1); lcd.print(lcdShadow.line2);
+            xSemaphoreGive(xI2CMutex);
+        }
+        lcdShadow.dirty = false;
+        xSemaphoreGive(xShadowMutex);
+    }
 }
 
-void smartLCD(const String& l1, const String& l2) {
-  smartLCD(l1.c_str(), l2.c_str());
-}
+void smartLCD(const char* l1, const char* l2) { uiUpdateLCD(l1, l2, 0); }
+void smartLCD(String l1, String l2) { uiUpdateLCD(l1.c_str(), l2.c_str(), 0); }
 
 void handleLCDBacklight() {
-  if (!lcdOK) return;
+    uint8_t r = 0, g = 0, b = 0;
+    if (isRoomDarknessActive) { r = 0; g = 0; b = 0; }
+    else if (overheatLock) { r = (millis() % 1000 < 500) ? 255 : 0; g = 0; b = 0; }
+    else if (statusSafeOn) { r = (set_max > 0) ? set_max : 255; g = 0; b = 0; }
+    else if (statusEnlargerOn) { r = 255; g = 255; b = 255; }
+    else { uint8_t v = (set_lcd > 0) ? set_lcd : 100; r = v; g = v; b = v; }
 
-  bool isScreenOff = roomLatch || screenOffOverride;
-  if (isScreenOff) {
-    lcd.setRGB(0, 0, 0);
-    return;
-  }
-
-  uint8_t v = set_lcd;
-  lcd.setRGB(v, v, v);
+    if (r != lastR || g != lastG || b != lastB) {
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            lcd.setRGB(r, g, b);
+            xSemaphoreGive(xI2CMutex);
+            lastR = r; lastG = g; lastB = b;
+        }
+    }
 }
 
 void triggerInfo() {
-  String L1 = "";
-  String L2 = "";
-  
-  String stepText = stepNames[(int)globalStepMode]; 
-
-  if (currentMode == MODE_BW) {
-    L1 = "BW Mode";
-    String evLabel = "EV " + stepText;
-    while (L1.length() + evLabel.length() < 16) L1 += " ";
-    L1 += evLabel;
-    L2 = "T:" + String(time_bw, 1) + "s G:" + String(grade_bw, 1);
-  } 
-  else {
-    L1 = "S:" + String(time_soft, 1) + "s";
-    while (L1.length() + stepText.length() < 16) L1 += " ";
-    L1 += stepText;
-    L2 = "H:" + String(time_hard, 1) + "s";
-  }
-
-  smartLCD(L1, L2);
-  updateNextionUI(false);
+    char l1[17] = {0}; char l2[17] = {0};
+    
+    if (overheatLock) {
+        strcpy(l1, "!! OVERHEAT !!"); strcpy(l2, "SYSTEM HALTED");
+    } 
+    else {
+        switch (currentMode) {
+            case MODE_BW:
+                snprintf(l1, 17, "BW Mode %s", (burnEv != 0.0) ? "BURN" : "");
+                // BETA-FIX: Schritt 3 - Solange ein neuer Messwert zur Uebernahme
+                // ansteht, wird die zweite Zeile als eindeutige Apply-Vorschau
+                // dargestellt. Die normale Dosis-/Zeitdarstellung wird nur gezeigt,
+                // wenn kein Pending-Messwert vorhanden ist.
+                if (bwAutoPending) {
+                    // BETA-FIX: Schritt 4 - Zusaetzliches visuelles Prompting.
+                    // Neben dem Dosisvorschlag blinkt ein Marker ("!"), damit der
+                    // Nutzer eindeutig sieht, dass eine aktive Bestaetigung (ENTER)
+                    // aussteht. Das Blinken nutzt nur millis() und blockiert nicht.
+                    const bool blinkOn = ((millis() / 500UL) % 2UL) == 0UL;
+                    snprintf(l2, 17, "APPLY? %0.1fd%s", target_dose, blinkOn ? "!" : " ");
+                } else if (hwSwitchDoseMode) {
+                    snprintf(l2, 17, "D:%0.1f G:%0.1f", dose_bw, grade_bw);
+                } else {
+                    snprintf(l2, 17, "T:%0.1fs G:%0.1f", time_bw, grade_bw);
+                }
+                break;
+            case MODE_SG:
+                strcpy(l1, "Splitgrade Mode");
+                if (hwSwitchDoseMode) snprintf(l2, 17, "S:%0.1f H:%0.1f", dose_soft, dose_hard);
+                else snprintf(l2, 17, "S:%0.1fs H:%0.1fs", time_soft, time_hard);
+                break;
+            case MODE_BURN:
+                strcpy(l1, "Burn Mode");
+                snprintf(l2, 17, "+%0.1f EV G:%0.1f", burnEv, burnGrade);
+                break;
+            case MODE_CALIB:
+                strcpy(l1, "Paper Calibrate"); strcpy(l2, "ENTER to Start");
+                break;
+            case MODE_DENS:
+                strcpy(l1, "Densitometer"); strcpy(l2, "ENTER to Start");
+                break;
+            case MODE_TESTSTRIP:
+                strcpy(l1, "Test Strip"); strcpy(l2, "ENTER to Start");
+                break;
+            case MODE_SETUP:
+                strcpy(l1, "System Setup"); strcpy(l2, "ENTER to Start");
+                break;
+            default:
+                strcpy(l1, "Dukatimer v0.5"); break;
+        }
+        appendRightAlignedStep(l1, sizeof(l1));
+    }
+    uiUpdateLCD(l1, l2, 0);
 }
 
 // =============================================================================
-// NEXTION UI UPDATE
+// NEXTION UI LOGIK
 // =============================================================================
+
+/**
+ * v0.5.8 Hilfsfunktion: Histogramm-Snapshot und Delta-Update.
+ * Erhält die Performance bei vielen Messwerten.
+ */
+static void updateNextionHistogram(bool force, bool liveMetering) {
+    uint8_t histogramSnapshot[11] = {0};
+    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+    memcpy(histogramSnapshot, currentZoneHistogram, sizeof(histogramSnapshot));
+    xSemaphoreGive(gTimerMutex);
+
+    int changedZone = -1;
+    for (int i = 0; i < 11; i++) {
+        if (histogramSnapshot[i] != prevZoneHistogram[i]) changedZone = i;
+        prevZoneHistogram[i] = histogramSnapshot[i];
+    }
+    if (changedZone >= 0) lastZoneVal = changedZone;
+    if (lastZoneVal < 0) lastZoneVal = 0;
+
+    if (force || liveMetering || lastZoneVal != lastSentZoneVal) {
+        DM_setNumber(OBJ_SG_ZONE, lastZoneVal);
+        lastSentZoneVal = lastZoneVal;
+    }
+
+    String hist; hist.reserve(64);
+    for (int i = 0; i < 11; i++) {
+        if (i > 0) hist += ",";
+        hist += String((int)histogramSnapshot[i]);
+    }
+    if (force || liveMetering || hist != lastZoneHist) {
+        DM_setText(OBJ_SG_HIST, hist);
+        lastZoneHist = hist;
+    }
+}
 
 void updateNextionUI(bool force) {
-  // Statische Speicher für den letzten gesendeten Zustand
-  static char lastTimeStr[32] = {0};
-  static char lastPowStr[32] = {0};
-  static char lastTempRStr[32] = {0};
-  static char lastTempAStr[32] = {0};
-  static int lastBtScr = -1;
-  static int lastBtMnu = -1;
-  static int lastBtSw = -1;
-  static int lastBtSg = -1;
-  static int lastBtSl = -1;
-  static int lastBtFoc = -1;
-  static int lastT2Visible = -1;
+    const bool lockPageActive = ExposureEngine_IsRunning() || lightOperationActive;
 
-  // --- 1. ZEIT ANZEIGE ---
-  char buf[32];
-  if (currentMode == MODE_BW) {
-    snprintf(buf, sizeof(buf), "%.1fs", time_bw);
-  } else {
-    snprintf(buf, sizeof(buf), "%.1f/%.1fs", time_soft, time_hard);
-  }
-  
-  // Nur senden, wenn geändert oder force
-  if (force || strcmp(buf, lastTimeStr) != 0) {
-    DM_setText("tTime", buf);
-    strncpy(lastTimeStr, buf, sizeof(lastTimeStr) - 1);
-    lastTimeStr[sizeof(lastTimeStr) - 1] = '\0';
-  }
-
-  // --- 2. LEISTUNG ---
-  snprintf(buf, sizeof(buf), "%d", set_max);
-  if (force || strcmp(buf, lastPowStr) != 0) {
-    DM_setText("tPow", buf);
-    strncpy(lastPowStr, buf, sizeof(lastPowStr) - 1);
-    lastPowStr[sizeof(lastPowStr) - 1] = '\0';
-  }
-  
-  // --- 3. TEMPERATUR (Raum) ---
-  if (bmpOK && bmpPtr != nullptr) {
-    snprintf(buf, sizeof(buf), "%.1f C", tempRoom); // Nutzt die globale Variable aus main loop
-    if (force || strcmp(buf, lastTempRStr) != 0) {
-      DM_setText("tTempR", buf);
-      strncpy(lastTempRStr, buf, sizeof(lastTempRStr) - 1);
-      lastTempRStr[sizeof(lastTempRStr) - 1] = '\0';
-    }
-  }
-
-  // --- 4. TEMPERATUR (Alu) ---
-  if (tempSensorOK) {
-    snprintf(buf, sizeof(buf), "%.1f C", tempAlu);
-    if (force || strcmp(buf, lastTempAStr) != 0) {
-      DM_setText("tTempA", buf);
-      strncpy(lastTempAStr, buf, sizeof(lastTempAStr) - 1);
-      lastTempAStr[sizeof(lastTempAStr) - 1] = '\0';
-    }
-  }
-
-  // --- 5. BUTTONS & ICONS ---
-  bool isScreenOff = roomLatch || screenOffOverride;
-  bool screenOffState = isScreenOff || isMeasuring;
-  int valScr = screenOffState ? 1 : 0;
-  
-  if (force || valScr != lastBtScr) {
-    DM_setNumber("btSCR", valScr);
-    // Dimmen direkt hier handhaben
-    DM_sendCommand(screenOffState ? "dim=5" : "dim=100");
-    lastBtScr = valScr;
-    lastDimState = screenOffState; // Sync für globale Variable
-  }
-
-  int valMnu = setupMenuActive ? 1 : 0;
-  if (force || valMnu != lastBtMnu) {
-    DM_setNumber("btMNU", valMnu);
-    lastBtMnu = valMnu;
-  }
-
-  bool wirelessFresh = (millis() - lastRemotePacketMs) < 2000;
-  bool sensorConnected = useWirelessProbe ? wirelessFresh : tslBaseOK;
-  int valT2 = sensorConnected ? 1 : 0;
-  if (force || valT2 != lastT2Visible) {
-    DM_setVisible("t2", sensorConnected);
-    DM_setText("t2", sensorConnected ? "WIFI" : "---");
-    lastT2Visible = valT2;
-  }
-
-  // Modus Buttons
-  int valSw = (currentMode == MODE_BW ? 1 : 0);
-  if (force || valSw != lastBtSw) {
-    DM_setNumber("btSW", valSw);
-    lastBtSw = valSw;
-  }
-
-  int valSg = (currentMode == MODE_SG ? 1 : 0);
-  if (force || valSg != lastBtSg) {
-    DM_setNumber("btSG", valSg);
-    lastBtSg = valSg;
-  }
-  
-  // Safe Light Status (basiert jetzt auf der synchronisierten Variable)
-  int valSl = safeLatch ? 1 : 0;
-  if (force || valSl != lastBtSl) {
-    DM_setNumber("btSL", valSl);
-    lastBtSl = valSl;
-  }
-  
-  // Focus Light Status
-  int valFoc = whiteLatch ? 1 : 0;
-  if (force || valFoc != lastBtFoc) {
-    DM_setNumber("btFOC", valFoc);
-    lastBtFoc = valFoc;
-  }
-}
-// =============================================================================
-// TOUCH HANDLER
-// =============================================================================
-
-void handleNextionTouch(uint8_t page, uint8_t id, uint8_t event) {
-    extern void handleSetup();
-    // Menü öffnen (ID15)
-    if (id == ID_MAIN_MENU && event == 0) {
-      beepClick();
-      if (setupMenuActive) {
-        nextionKeyBuf = '*';
-      } else {
-        handleSetup();
-      }
-      return;
-    }
-  if (page != PAGE_MAIN) return;
-
-  switch(id) {
-    case ID_MAIN_SW: 
-      if (event == 0) { beepClick(); currentMode = MODE_BW; triggerInfo(); }
-      break;
-      
-    case ID_MAIN_SG: 
-      if (event == 0) { beepClick(); currentMode = MODE_SG; triggerInfo(); }
-      break;
-
-    case ID_MAIN_DENS:
-      if (event == 0) { beepClick(); enterDensMode(); }
-      break;
-      
-    case ID_MAIN_START:
-      if (event == 0) {
-        beepClick();
-        // Direktes Starten/Stoppen des Timers
-        if (starttime == 0) startTimer();
-        else stopTimer();
-      }
-      break;
-      
-    case ID_MAIN_SL: 
-      if (event == 0) { 
-        beepClick();
-        safeLatch = !safeLatch; 
-        if (safeLatch) whiteLatch = false; 
-      } 
-      break;
-      
-    case ID_MAIN_FOCUS: 
-      if (event == 0) {
-        beepClick();
-        if (!safeLatch && digitalRead(PIN_SW_SAFE) == HIGH) {
-           whiteLatch = !whiteLatch;
+    // 1. Seitensteuerung (Switch-Kaskade für Pages 0-9)
+    if (force || currentMode != lastMode || lockPageActive != lastLockPageActive) {
+        String cmd = "page ";
+        if (lockPageActive) cmd += PAGE_LOCK;
+        else if (bootScreenActive) cmd += PAGE_BOOT;
+        else {
+            switch(currentMode) {
+                case MODE_BW: cmd += PAGE_MAIN; break;
+                case MODE_SG: cmd += PAGE_SG; break;
+                case MODE_BURN: cmd += PAGE_BURN; break;
+                case MODE_CALIB: cmd += PAGE_CALIB; break;
+                case MODE_TESTSTRIP: cmd += PAGE_TESTSTRIP; break;
+                case MODE_DENS: cmd += PAGE_WIZARD; break;
+                case MODE_SETUP: cmd += PAGE_MENU; break;
+                case MODE_BRIDGE: cmd += PAGE_DIAG; break;
+                default: cmd += PAGE_MAIN; break;
+            }
         }
-      } 
-      break;
-      
-    case ID_MAIN_SCREEN: 
-      if (event == 0) { beepClick(); screenOffOverride = !screenOffOverride; }
-      break;
-      
-    case ID_MAIN_HASH: 
-      if (event == 1) hashPressStart = millis(); 
-      else if (event == 0) {
-        if (millis() - hashPressStart > 2000) {
-          defaultsSettings();
-        } else {
-          beepClick();
-          nextionKeyBuf = '*';
+        DM_sendCommand(cmd.c_str());
+        lastMode = currentMode;
+        lastLockPageActive = lockPageActive;
+    }
+
+    // 2. Modus-spezifische Updates
+    if (lockPageActive) {
+        const unsigned long elapsedMs = ExposureEngine_GetElapsedMs();
+        DM_setText(TXT_LOCK_TIME, String(elapsedMs / 1000.0, 1) + "s");
+        DM_setNumber(OBJ_LOCK_PROG, 0);
+    } 
+    else {
+        switch (currentMode) {
+            case MODE_BW: {
+                if (force || time_bw != lastTimeBW) { 
+                    DM_setText(TXT_MAIN_TIME, String(time_bw, 1) + (hwSwitchDoseMode ? "d" : "s")); 
+                    lastTimeBW = time_bw; 
+                }
+                if (force || grade_bw != lastGradeBW) { 
+                    DM_setText(TXT_MAIN_GRADE, String(grade_bw, 1)); 
+                    lastGradeBW = grade_bw; 
+                }
+                break;
+            }
+
+            case MODE_SG: {
+                String sgPhase;
+                if (splitState == SPLIT_DOING_SOFT) sgPhase = "SOFT RUN";
+                else if (splitState == SPLIT_SOFT_DONE) sgPhase = "HARD READY";
+                else if (splitState == SPLIT_DOING_HARD) sgPhase = "HARD RUN";
+                else sgPhase = "SOFT READY";
+
+                if (force || sgPhase != lastSgPhase) {
+                    DM_setText(OBJ_SG_PHASE, sgPhase);
+                    lastSgPhase = sgPhase;
+                }
+                updateNextionHistogram(force, isMeasurementActive());
+                break;
+            }
+
+            case MODE_BURN: {
+                DM_setText(TXT_BURN_TIME, String(getEffectiveBurnTime(), 1) + "s");
+                DM_setText(TXT_BURN_GRADE, String(burnGrade, 1));
+                DM_setText(TXT_BURN_EV, String(burnEv, 1) + " EV");
+                break;
+            }
+
+            case MODE_DENS: {
+                DM_setText(TXT_DENS_LUX, "Lux: " + String(remoteLux, 1));
+                const double dens = (densRefLux > 0) ? log10(densRefLux / (remoteLux > 0.001 ? remoteLux : 0.001)) : 0.0;
+                DM_setText(TXT_DENS_VAL, "D: " + String(dens, 2));
+                break;
+            }
+
+            case MODE_BRIDGE: {
+                DM_setText(TXT_DIAG_STATUS, probeConnected ? "CONNECTED" : "DISCONNECTED");
+                DM_setText(TXT_DIAG_G0, "G0: " + String(probeLuxG0, 1));
+                DM_setText(TXT_DIAG_G5, "G5: " + String(probeLuxG5, 1));
+                DM_setText(TXT_DIAG_VAL, "Lost: " + String(totalDroppedPackets));
+                break;
+            }
         }
-      }
-      break;
-  }
-  // NOTE: Do NOT call handleLights() or triggerInfo() here - they are called every main loop iteration
-  // Calling them here causes redundant execution and potential static cache inconsistency in updateNextionUI()
+        
+        // Globale Parameter (z.B. Screen Off)
+        int valScr = isRoomDarknessActive ? 1 : 0;
+        if (force || valScr != lastBtScr) {
+            DM_setNumber(NUM_MAIN_SCR, valScr); lastBtScr = valScr;
+        }
+    }
 }
 
-void refreshPage(uint8_t pageId) {
-  if (pageId == PAGE_MAIN) triggerInfo();
+// =============================================================================
+// EVENT HANDLING (Nextion -> System)
+// =============================================================================
+
+void handleNextionEvent(const char* msg) {
+    if (!msg || !*msg) return;
+
+    // Funktionale Events (Neu)
+    if (streq(msg, EVT_MAIN_START))  { beepClick(); injectVirtualButton(EVT_START_PRESSED); return; }
+    if (streq(msg, EVT_MAIN_SAFE))   { beepClick(); safeLatch = !safeLatch; if (safeLatch) whiteLatch = false; return; }
+    if (streq(msg, EVT_MAIN_FOCUS))  { beepClick(); if (!safeLatch) whiteLatch = !whiteLatch; return; }
+    if (streq(msg, EVT_MAIN_SCREEN)) { beepClick(); isRoomDarknessActive = !isRoomDarknessActive; return; }
+    if (streq(msg, EVT_MAIN_DENS))   { beepClick(); injectVirtualButton(EVT_DENS_REQUEST); return; }
+    if (streq(msg, EVT_MAIN_APPLY))  { injectVirtualButton(EVT_ENTER_PRESSED); return; }
+    if (streq(msg, EVT_MAIN_BRIDGE)) { currentMode = MODE_BRIDGE; return; }
+
+    if (streq(msg, EVT_SG_MEASURE))  { injectVirtualButton(EVT_GRADE_LONG); return; }
+    if (streq(msg, EVT_SG_START))    { injectVirtualButton(EVT_START_PRESSED); return; }
+    if (streq(msg, EVT_SG_RESET))    { injectVirtualButton(EVT_GRADE_LONG); return; }
+}
+
+/**
+ * handleNextionCommand: Erhält die Abwärtskompatibilität zu v0.5.8 (Button-IDs).
+ */
+void handleNextionCommand(const char* cmd) {
+    if (!cmd) return;
+    const char* payload = cmd;
+
+    // Support for page scripts that prepend ASCII header "TEXT".
+    if (strncmp(payload, "TEXT", 4) == 0) {
+        payload += 4;
+    }
+
+    // First, try new functional string events (main_*, sg_*).
+    handleNextionEvent(payload);
+
+    // Keep legacy button IDs for v0.5.8 HMI compatibility.
+    if (streq(payload, EVT_CMD_START)) { beepClick(); injectVirtualButton(EVT_START_PRESSED); }
+    else if (streq(payload, EVT_CMD_SAFE)) { beepClick(); safeLatch = !safeLatch; if (safeLatch) whiteLatch = false; }
+    else if (streq(payload, EVT_CMD_FOCUS)) { beepClick(); if (!safeLatch) whiteLatch = !whiteLatch; }
+    else if (streq(payload, EVT_CMD_SCREEN)) { beepClick(); isRoomDarknessActive = !isRoomDarknessActive; }
+    else if (streq(payload, EVT_CMD_DENS)) { beepClick(); injectVirtualButton(EVT_DENS_REQUEST); }
+    else if (streq(payload, EVT_CMD_APPLY)) { injectVirtualButton(EVT_ENTER_PRESSED); }
+}
+
+void initDisplays() {
+    DM_init(); 
+    triggerInfo(); 
+    handleLCDBacklight(); 
 }

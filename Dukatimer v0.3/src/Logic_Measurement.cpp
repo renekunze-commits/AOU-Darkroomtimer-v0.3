@@ -1,355 +1,341 @@
+/* Logic_Measurement.cpp - v0.5 Root Cause Edition
+   
+   ARCHITEKTUR-REGELN:
+   - Läuft primär auf Core 1 (TaskRealtime).
+   - Datensicherheit via gTimerMutex für das Histogramm und den Status.
+   - Direkte HAL-Kommunikation für minimalen Jitter bei Mess-Blitzen.
+   - Konsistenz: Nutzt currentZoneHistogram aus Globals.h.
+   - NEU: probeDarkLux Abzug zur Vermeidung von systematischen Werten bei D>2.0
+*/
+
+#include "Logic_Measurement.h"
+#include "Globals.h"
+#include "Logic_Math.h"
+#include "Logic_Papers.h"
+#include "DisplayManager.h"
 #include <Arduino.h>
 #include <math.h>
-#include "Globals.h"
-#include "Logic_Measurement.h"
-#include "Logic_Papers.h"
 
-namespace {
-  unsigned long msgUntilMs = 0;
-  char msgLine1[17] = {0};
-  char msgLine2[17] = {0};
-  unsigned long measureDeadlineMs = 0;
-  float spectralLuxG0 = 0.0f;
+// NEXTION UI INTEGRATION (Nur Ergänzung)
+extern void updateNextionUI(bool force);
 
-  void setMessage(const char *l1, const char *l2, unsigned long durationMs) {
-    snprintf(msgLine1, sizeof(msgLine1), "%-16s", l1 ? l1 : "");
-    snprintf(msgLine2, sizeof(msgLine2), "%-16s", l2 ? l2 : "");
-    msgUntilMs = millis() + durationMs;
-  }
+// --- Lokaler Status (Isoliert auf Core 1) ---
+enum SpectralState {
+    SPEC_IDLE,
+    SPEC_G0_WARMUP,
+    SPEC_G0_WAIT_DATA,
+    SPEC_G5_WARMUP,
+    SPEC_G5_WAIT_DATA
+};
 
-  void clearMeasures(bool allChannels) {
-    if (currentMode == MODE_BW) {
-      measBWSum = 0.0;
-      measBWCount = 0;
-      return;
+static SpectralState internalSpecState = SPEC_IDLE;
+static unsigned long measureTimer = 0;
+static float tempLuxG0 = 0.0;
+static float tempLuxG5 = 0.0;
+static int lastMeasuredZone = -1; 
+static bool wasSafelightOn = false;
+static bool currentMeasurementUsesWhite = false;
+
+// Externe Wireless-Funktionen (HW_Wireless.cpp)
+extern void sendProbeMeasureCmd(uint8_t cmd);
+extern void sendRenderPacketToC6();
+
+// =============================================================================
+// SESSION MANAGEMENT
+// =============================================================================
+
+void startMeteringSession() {
+    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        internalSpecState = SPEC_IDLE;
+        tempLuxG0 = 0.0;
+        tempLuxG5 = 0.0;
+        lastMeasuredZone = -1;
+        
+        // Histogramm leeren (Grounding des Belichtungsspeichers)
+        for(int i=0; i<11; i++) {
+            currentZoneHistogram[i] = 0;
+        }
+        xSemaphoreGive(gTimerMutex);
+        Serial.println("[MEASURE] Neue Spot-Session gestartet. Histogramm geleert.");
+        
+        updateNextionUI(true); // UI-Trigger
     }
-    if (allChannels) {
-      measSoftSum = 0.0; measSoftCount = 0;
-      measHardSum = 0.0; measHardCount = 0;
-      return;
-    }
-    if (measureMode == MM_APPLY_SG_G0) {
-      measSoftSum = 0.0; measSoftCount = 0;
-    } else if (measureMode == MM_APPLY_SG_G5) {
-      measHardSum = 0.0; measHardCount = 0;
-    }
-  }
+}
 
-  void renderUI() {
-    char l1[17];
-    char l2[17];
-
-    if (millis() < msgUntilMs) {
-      smartLCD(msgLine1, msgLine2);
-      return;
+void undoLastMeasurement() {
+    if (lastMeasuredZone != -1) {
+        if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            // Ein Spot entspricht 20 Einheiten im Histogramm (Anzeige-Skalierung)
+            if (currentZoneHistogram[lastMeasuredZone] >= 20) {
+                currentZoneHistogram[lastMeasuredZone] -= 20;
+            } else {
+                currentZoneHistogram[lastMeasuredZone] = 0;
+            }
+            lastMeasuredZone = -1; 
+            xSemaphoreGive(gTimerMutex);
+            
+            sendRenderPacketToC6(); 
+            uiTriggerBeep(SND_BACK);
+            
+            updateNextionUI(true); // UI-Trigger
+        }
     }
+}
 
-    if (currentMode == MODE_BW) {
-      double avg = (measBWCount > 0) ? (measBWSum / (double)measBWCount) : NAN;
-      snprintf(l1, sizeof(l1), "BW n%02d", measBWCount);
-      if (measBWCount > 0 && isfinite(avg)) {
-        snprintf(l2, sizeof(l2), "avg %.2f OK=E", avg);
-      } else {
-        snprintf(l2, sizeof(l2), "ADD=G OK=E");
-      }
-      smartLCD(l1, l2);
-      return;
-    }
+void finalizeMeteringSession() {
+    // FIX K4: Hardware-Restore identisch zu abortMeasurementWithError()
+    HW_SetEnlargerNeoPixel(0, 0, 0);
+    if (wasSafelightOn) HW_SetSafelight(true);
 
-    const bool isSoft = (measureMode == MM_APPLY_SG_G0);
-    const int count = isSoft ? measSoftCount : measHardCount;
-    const double avg = (count > 0) ? ((isSoft ? measSoftSum : measHardSum) / (double)count) : NAN;
-    snprintf(l1, sizeof(l1), "SG %s n%02d", isSoft ? "SOFT" : "HARD", count);
-    if (count > 0 && isfinite(avg)) {
-      snprintf(l2, sizeof(l2), "avg %.2f OK=E", avg);
-    } else {
-      snprintf(l2, sizeof(l2), "ADD=G TOG=B");
-    }
-    smartLCD(l1, l2);
-  }
-
-  void restorePreviousLights() {
-    // Kein direkter Pin-Zugriff hier: nur Override freigeben.
-    // Die zentrale handleLights()-State-Machine übernimmt im nächsten Loop
-    // wieder vollständig anhand der realen Schalterzustände.
+    internalSpecState = SPEC_IDLE;
     isMeasuring = false;
-    probeFlashActive = false;
-    measurementOverrideActive = false;
-  }
-
-  void sendRenderPacketToC6(const char* header, const char* line1, const char* line2, uint8_t haptic) {
-    uint8_t pMode = (currentMode == MODE_BW) ? PMODE_METER_BW : PMODE_METER_SG;
-    sendProbeRender(header, line1, line2, currentZoneHistogram, haptic, pMode);
-  }
+    lightOperationActive = false;
+    currentMeasurementUsesWhite = false;
+    Serial.println("[MEASURE] Session beendet.");
+    
+    updateNextionUI(true); // UI-Trigger
 }
 
-bool triggerSpectralMeasurement() {
-  if (currentMeasureState != MEASURE_IDLE) return false;
-
-  isMeasuring = true;
-  probeFlashActive = true;
-
-  setLEDMode(LED_GREEN);
-  sendProbeMeasureCmd(CMD_MEASURE_G0);
-  currentMeasureState = MEASURE_G0_WAIT_DATA;
-  measureDeadlineMs = millis() + 3000;
-  sendRenderPacketToC6("[ MEASURE ]", "GREEN phase", "Wait data...", HAPTIC_CLICK);
-  return true;
-}
-
-void abortMeasurementWithError(const char* line1) {
-  currentMeasureState = MEASURE_ERROR;
-  restorePreviousLights();
-  sendRenderPacketToC6("[ ERROR ]", line1 ? line1 : "Measure fail", "", HAPTIC_ERROR);
-  beepWarnLong();
-  currentMeasureState = MEASURE_IDLE;
-}
-
-bool handleMeasurementStateMachine(uint8_t evt, float luxG0, float luxG5) {
-  if (currentMeasureState == MEASURE_IDLE) return false;
-
-  if (evt == EVT_T1_CLICK || evt == EVT_T2_CLICK) {
-    abortMeasurementWithError("ABORT");
-    return true;
-  }
-
-  if (currentMeasureState == MEASURE_G0_WAIT_DATA) {
-    if (evt == EVT_LUX_DATA) {
-      spectralLuxG0 = luxG0;
-      setLEDMode(LED_BLUE);
-      sendProbeMeasureCmd(CMD_MEASURE_G5);
-      currentMeasureState = MEASURE_G5_WAIT_DATA;
-      measureDeadlineMs = millis() + 3000;
-      sendRenderPacketToC6("[ MEASURE ]", "BLUE phase", "Wait data...", HAPTIC_CLICK);
-      return true;
-    }
-    if ((long)(millis() - measureDeadlineMs) >= 0) {
-      abortMeasurementWithError("Timeout G0");
-    }
-    return false;
-  }
-
-  if (currentMeasureState == MEASURE_G5_WAIT_DATA) {
-    if (evt == EVT_LUX_DATA) {
-      processSpotMeasurement(spectralLuxG0, luxG5);
-      // Render nur hier zentral senden (State-Machine Owner), nicht im Math-Kern.
-      char l1[16] = {0};
-      char l2[16] = {0};
-      if (currentMode == MODE_BW) {
-        snprintf(l1, sizeof(l1), "T %.2fs", time_bw);
-        snprintf(l2, sizeof(l2), "Z8 ref");
-      } else {
-        snprintf(l1, sizeof(l1), "Tg %.2fs", time_soft);
-        snprintf(l2, sizeof(l2), "Tb %.2fs", time_hard);
-      }
-      sendRenderPacketToC6("[ ZONE VIII ]", l1, l2, HAPTIC_DONE);
-      restorePreviousLights();
-      currentMeasureState = MEASURE_IDLE;
-      return true;
-    }
-    if ((long)(millis() - measureDeadlineMs) >= 0) {
-      abortMeasurementWithError("Timeout G5");
-    }
-  }
-  return false;
-}
-
-void processSpotMeasurement(float luxG0, float luxG5) {
-  if (!isfinite(luxG0) || !isfinite(luxG5) || luxG0 <= 0.001f || luxG5 <= 0.001f) return;
-
-  const PaperProfile &activePaperProfile = getActivePaper();
-
-  if (currentMeasureFocus == FOCUS_HIGHLIGHTS) {
-    // Lichter-Messung: definiert die Basis-Belichtungszeit (Zone VIII Referenz).
-    targetDoseSoft = (activePaperProfile.Ksoft > 0.0) ? activePaperProfile.Ksoft : 10.0;
-    targetDoseHard = (activePaperProfile.Khard > 0.0) ? activePaperProfile.Khard : 10.0;
-
-    timer_base_seconds = targetDoseSoft / (double)luxG0;
-    if (!isfinite(timer_base_seconds) || timer_base_seconds <= 0.0) return;
-
-    if (currentMode == MODE_BW) {
-      time_bw = timer_base_seconds;
-      measBWSum += luxG0;
-      measBWCount++;
-    } else {
-      time_soft = timer_base_seconds;
-      time_hard = targetDoseHard / (double)luxG5;
-      measSoftSum += luxG0;
-      measSoftCount++;
-      measHardSum += luxG5;
-      measHardCount++;
-    }
-    validateTimes();
-
-    memset(currentZoneHistogram, 0, sizeof(currentZoneHistogram));
-    currentZoneHistogram[8] = 255;
-    beepOk();
-    return;
-  }
-
-  // Schatten-Messung: nur gültig, wenn zuvor eine Basis-Zeit über Lichter gesetzt wurde.
-  if (!isfinite(timer_base_seconds) || timer_base_seconds <= 0.0) return;
-
-  const double doseMinG0 = (activePaperProfile.Ksoft > 0.0) ? activePaperProfile.Ksoft : 10.0;
-  // Da keine expliziten doseMax-Felder existieren, robust aus Khard/Ksoft ableiten.
-  const double doseMaxG0 = (activePaperProfile.Khard > doseMinG0)
-    ? activePaperProfile.Khard
-    : (doseMinG0 * 4.0);
-
-  const double range = doseMaxG0 - doseMinG0;
-  if (!isfinite(range) || range <= 0.0) return;
-
-  const double spotDose = (double)luxG0 * timer_base_seconds;
-  if (!isfinite(spotDose) || spotDose <= 0.0) return;
-
-  const double ratio = spotDose / doseMinG0;
-  if (!isfinite(ratio) || ratio <= 0.0) return;
-  const double deltaEV = log2(ratio);
-
-  const double rangeEV = log2(doseMaxG0 / doseMinG0);
-  if (!isfinite(rangeEV) || rangeEV <= 0.0) return;
-
-  // Zone 8 entspricht doseMinG0. Nach unten Richtung Zone 0, nach oben Richtung 10.
-  const double zoneFloat = 8.0 + (deltaEV * (2.0 / rangeEV));
-  int zoneIndex = (int)lround(zoneFloat);
-  zoneIndex = constrain(zoneIndex, 0, 10);
-
-  memset(currentZoneHistogram, 0, sizeof(currentZoneHistogram));
-  currentZoneHistogram[zoneIndex] = 255;
-  beepOk();
+bool isMeasurementActive() {
+    return (internalSpecState != SPEC_IDLE);
 }
 
 bool isMeteringActive() {
-  return (measureMode != MM_OFF);
+    return isMeasurementActive();
 }
 
-void startMeteringSession() {
-  if (starttime != 0 || currentMode == MODE_DENS) {
-    beepWarnLong();
-    setMessage("BUSY", "STOP TIMER", 800);
-    return;
-  }
+// =============================================================================
+// STATE MACHINE (Core 1 - Hochfrequent)
+// =============================================================================
 
-  measureMode = (currentMode == MODE_BW) ? MM_APPLY_BW : MM_APPLY_SG_G0;
-  measSoftSum = 0.0; measSoftCount = 0;
-  measHardSum = 0.0; measHardCount = 0;
-  measBWSum = 0.0;  measBWCount = 0;
-  measureUiSinceMs = millis();
-  beepNav();
-  setMessage("METER MODE", "ADD=G OK=E", 600);
+void abortMeasurementWithError(const char* line1) {
+    // Hardware-Grounding: Sicherer Lichtzustand wiederherstellen
+    HW_SetEnlargerNeoPixel(0, 0, 0);
+    if (wasSafelightOn) HW_SetSafelight(true);
+    
+    internalSpecState = SPEC_IDLE;
+    isMeasuring = false; // FIX A5: Beim Abbruch zwingend clearen
+    lightOperationActive = false;
+    currentMeasurementUsesWhite = false;
+    if (line1 != nullptr) Serial.printf("[MEASURE ERROR] %s\n", line1);
+    
+    uiTriggerBeep(SND_WARN);
+    sendRenderPacketToC6(); 
+    
+    updateNextionUI(true); // UI-Trigger
 }
 
-void handleMeteringSession(bool addSpot, bool saveApply, bool toggleChannel, bool resetAll, bool cancel) {
-  if (measureMode == MM_OFF) return;
+bool triggerSpectralMeasurement() {
+    if (internalSpecState != SPEC_IDLE) return false; 
 
-  // --- Async Spot Tick (non-blocking Messung läuft) ---
-  if (isAsyncSpotBusy()) {
-    if (tickAsyncSpot()) {
-      // Messung fertig → Ergebnis verarbeiten
-      isMeasuring = false;
-      handleLights();
-      double avg = getAsyncSpotResult();
-
-      if (!isfinite(avg) || avg <= 0.0) {
-        beepWarnLong();
-        setMessage("MEASURE FAIL", "NO SENSOR", 700);
-      } else if (currentMode == MODE_BW) {
-        measBWSum += avg; measBWCount++;
-        beepOk();
-      } else if (measureMode == MM_APPLY_SG_G0) {
-        measSoftSum += avg; measSoftCount++;
-        beepOk();
-      } else if (measureMode == MM_APPLY_SG_G5) {
-        measHardSum += avg; measHardCount++;
-        beepOk();
-      }
+    bool fixedGradeActive = false;
+    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        // BETA-FIX: Schritt 4 - Beim Start jeder neuen Messung wird ein alter
+        // Pending-Vorschlag explizit verworfen. So wird verhindert, dass waehrend
+        // einer frischen Mess-Session noch ein vorheriger, nicht uebernommener
+        // Dosisvorschlag als gueltig angezeigt oder uebernommen wird.
+        bwAutoPending = false;
+        fixedGradeActive = getActivePaper().isFixedGrade;
+        xSemaphoreGive(gTimerMutex);
     }
-    renderUI();
-    return; // Während Messung: alle Inputs ignorieren
-  }
+    
+    isMeasuring = true; // FIX A5: Licht-Sperre aktivieren!
+    lightOperationActive = true;
+    wasSafelightOn = statusSafeOn;
+    currentMeasurementUsesWhite = fixedGradeActive;
+    
+    // Mess-Blitz Phase 1: Fix-Grade nutzt direkt Weißlicht, VC bleibt beim G/B-Split.
+    HW_SetSafelight(false);
 
-  if (cancel) {
-    cancelAsyncSpot();
-    measureMode = MM_OFF;
-    isMeasuring = false;
-    handleLights();
-    beepNav();
-    triggerInfo();
-    return;
-  }
-
-  if (resetAll) {
-    clearMeasures(true);
-    beepValue();
-    setMessage("MEASURE", "CLEARED", 600);
-  }
-
-  if (toggleChannel && currentMode == MODE_SG) {
-    measureMode = (measureMode == MM_APPLY_SG_G0) ? MM_APPLY_SG_G5 : MM_APPLY_SG_G0;
-    beepNav();
-    setMessage(measureMode == MM_APPLY_SG_G0 ? "SOFT" : "HARD", "CHANNEL", 400);
-  }
-
-  if (addSpot) {
-    // Non-blocking: Licht aus, Sensor-Settle abwarten, dann N Samples
-    isMeasuring = true;
-    handleLights();
-    lcd.setRGB(0, 0, 0);
-    updateNextionUI(true);
-    startAsyncSpot(7, 100, 150); // 150ms settle + 7×100ms sampling
-    renderUI();
-    return;
-  }
-
-  if (saveApply) {
-    const PaperProfile &paper = getActivePaper();
-    bool applied = false;
-
-    if (currentMode == MODE_BW) {
-      if (measBWCount == 0) {
-        beepWarnLong();
-        setMessage("NO MEASURES", "ADD=G", 800);
-      } else if (!(paper.Kbw > 0.0)) {
-        beepWarnLong();
-        setMessage("NO K DATA", "RUN TEACH", 900);
-      } else {
-        double avg = measBWSum / (double)measBWCount;
-        time_bw = paper.Kbw / avg;
-        applied = true;
-      }
+    if (fixedGradeActive) {
+        HW_SetEnlargerNeoPixel(0, 255, 255);
     } else {
-      if (measSoftCount == 0 && measHardCount == 0) {
-        beepWarnLong();
-        setMessage("NO MEASURES", "ADD=G", 800);
-      } else if ((measSoftCount > 0 && !(paper.Ksoft > 0.0)) ||
-                 (measHardCount > 0 && !(paper.Khard > 0.0))) {
-        beepWarnLong();
-        setMessage("NO K DATA", "RUN TEACH", 900);
-      } else {
-        if (measSoftCount > 0 && paper.Ksoft > 0.0) {
-          double avg = measSoftSum / (double)measSoftCount;
-          time_soft = paper.Ksoft / avg;
-          applied = true;
-        }
-        if (measHardCount > 0 && paper.Khard > 0.0) {
-          double avg = measHardSum / (double)measHardCount;
-          time_hard = paper.Khard / avg;
-          applied = true;
-        }
-      }
+        HW_SetEnlargerNeoPixel(0, 255, 0);
+    }
+    
+    // NEU: Akustisches START-Signal an der Basis für sofortiges Feedback
+    uiTriggerBeep(SND_CLICK); 
+    
+    measureTimer = millis();
+    internalSpecState = SPEC_G0_WARMUP;
+    
+    updateNextionUI(true); // UI-Trigger
+    return true;
+}
+
+bool handleMeasurementStateMachine(uint8_t evt, float luxG0, float luxG5) {
+    if (internalSpecState == SPEC_IDLE) return false;
+
+    // FIX: Remote Cancel (EVT_T1_CLICK vom C6) während aktiver Messung
+    if (evt == EVT_T1_CLICK) {
+        abortMeasurementWithError("Remote Cancel");
+        return true;
     }
 
-    if (applied) {
-      validateTimes();
-      markDirty();
-      resetTracking();
-      measureMode = MM_OFF;
-      beepOk();
-      setMessage("MEASURE", "APPLIED", 700);
-      triggerInfo();
-      return;
-    }
-  }
+    unsigned long now = millis();
 
-  renderUI();
+    switch (internalSpecState) {
+        
+        case SPEC_G0_WARMUP:
+            // LED Einschwingzeit abwarten (150ms für stabile Farbtemperatur)
+            if (now - measureTimer >= 150) { 
+                sendProbeMeasureCmd(1); // CMD_MEASURE_G0 an C6
+                measureTimer = now; 
+                internalSpecState = SPEC_G0_WAIT_DATA;
+            }
+            break;
+
+        case SPEC_G0_WAIT_DATA:
+            if (evt == EVT_LUX_DATA) { 
+                tempLuxG0 = luxG0;
+                if (currentMeasurementUsesWhite) {
+                    // FIX: Protect white-light fallback if both values too low
+                    const float whiteLux0 = luxG0;
+                    const float whiteLux5 = luxG5;
+                    const float whiteLux = (whiteLux0 > 0.01f) ? whiteLux0 :
+                                           (whiteLux5 > 0.01f) ? whiteLux5 : 0.0f;
+                    if (whiteLux <= 0.0f) {
+                        abortMeasurementWithError("low white lux");
+                        break;
+                    }
+                    tempLuxG0 = whiteLux;
+                    tempLuxG5 = whiteLux;
+
+                    HW_SetEnlargerNeoPixel(0, 0, 0);
+                    if (wasSafelightOn) HW_SetSafelight(true);
+
+                    processSpotMeasurement(tempLuxG0, tempLuxG5);
+                    sendRenderPacketToC6(); 
+                    internalSpecState = SPEC_IDLE;
+                    isMeasuring = false;
+                    lightOperationActive = false;
+                    currentMeasurementUsesWhite = false;
+                    uiTriggerBeep(SND_OK);
+                    
+                    updateNextionUI(true); // UI-Trigger
+                    break;
+                }
+
+                // Sofortiger Wechsel zu Blau (G5) für Phase 2
+                // ROOT CAUSE FIX: Echtes Blau für G5 Messung
+                HW_SetEnlargerNeoPixel(0, 0, 255); 
+                measureTimer = millis();
+                internalSpecState = SPEC_G5_WARMUP;
+            } 
+            // Remote-Handshake-Timeout auf 2500ms erhöht
+            else if (now - measureTimer > 2500) {
+                abortMeasurementWithError("Timeout G0"); 
+            }
+            break;
+
+        case SPEC_G5_WARMUP:
+            if (now - measureTimer >= 150) {
+                sendProbeMeasureCmd(2); // CMD_MEASURE_G5 an C6
+                measureTimer = now;
+                internalSpecState = SPEC_G5_WAIT_DATA;
+            }
+            break;
+
+        case SPEC_G5_WAIT_DATA:
+            if (evt == EVT_LUX_DATA) {
+                tempLuxG5 = luxG5;
+                
+                // Mess-Sequenz beendet: Hardware-Restore
+                HW_SetEnlargerNeoPixel(0, 0, 0);
+                if (wasSafelightOn) HW_SetSafelight(true);
+                
+                processSpotMeasurement(tempLuxG0, tempLuxG5);
+                sendRenderPacketToC6(); 
+                internalSpecState = SPEC_IDLE;
+                isMeasuring = false; // FIX A5: Sperre aufheben, Messung fertig
+                lightOperationActive = false;
+                currentMeasurementUsesWhite = false;
+                uiTriggerBeep(SND_OK);
+                
+                updateNextionUI(true); // UI-Trigger
+            }
+            else if (now - measureTimer > 2500) {
+                abortMeasurementWithError("Timeout G5");
+            }
+            break;
+            
+        default:
+            break;
+    }
+    return true; 
+}
+
+// =============================================================================
+// MATH ENGINE & HISTOGRAM
+// =============================================================================
+
+void processSpotMeasurement(float luxG0, float luxG5) {
+    // ROOT CAUSE FIX: C6 Dunkelstrom für Dichten > 2.0 eliminieren
+    float corrG0 = luxG0 - (float)probeDarkLux;
+    float corrG5 = luxG5 - (float)probeDarkLux;
+
+    if (corrG0 <= 0.01f || corrG5 <= 0.01f) {
+        Serial.println("[MATH ERROR] Bereinigte Lux-Werte zu gering (Dunkelstrom?). Ignoriert.");
+        return;
+    }
+
+    // Lux -> EV Berechnung (Logarithmisch zur Basis 2)
+    float ev_G0 = log2(corrG0); 
+    int berechneteZone = (int)round(ev_G0); 
+
+    // Begrenzung auf Zonen 0 bis 10 (Zonensystem)
+    if (berechneteZone < 0) berechneteZone = 0;
+    if (berechneteZone > 10) berechneteZone = 10;
+    
+    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        Mode modeSnapshot = currentMode;
+
+        // Histogramm-Eintrag (Max 240 für Balken-Anzeige)
+        if (currentZoneHistogram[berechneteZone] < 240) {
+            currentZoneHistogram[berechneteZone] += 20; 
+        }
+        lastMeasuredZone = berechneteZone;
+        
+        // Spektral-Verhältnis (G/B Ratio) für die Papier-Korrektur
+        spectral_ratio = (double)(corrG0 / corrG5);
+        
+        xSemaphoreGive(gTimerMutex);
+
+        // BETA-FIX: BW-Kopplung aktivieren, ohne dose_bw direkt zu ueberschreiben.
+        // Die Messung bleibt damit sicher (kein sofortiger Fogging-Risiko-Sprung).
+        if (modeSnapshot == MODE_BW) {
+            double suggestedDose = target_dose;
+            calculateAutoBW(corrG0, suggestedDose);
+
+            if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // BETA-FIX: Schritt 3 - Vorschlag gepuffert in target_dose.
+                // Direkte Aenderung von dose_bw ist explizit nicht gewuenscht.
+                target_dose = suggestedDose;
+
+                // BETA-FIX: Schritt 3 - Signalisierung erst NACH berechnetem
+                // und uebernommenem target_dose, damit der Pending-Status exakt
+                // einen konsistenten, aktuellen Vorschlagswert repraesentiert.
+                bwAutoPending = true;
+                xSemaphoreGive(gTimerMutex);
+            }
+        }
+        
+        Serial.printf("[MATH] Spot! Zone: %d | Ratio: %.3f\n", berechneteZone, spectral_ratio);
+        
+        updateNextionUI(true); // UI-Trigger für Histogramm
+    }
+}
+
+void handleMeteringSession(bool actionSave, bool actionCancel, bool actionToggle, bool actionReset, bool actionUndo) {
+    if (actionCancel) {
+        finalizeMeteringSession();
+        uiTriggerBeep(SND_BACK);
+    }
+    if (actionUndo) {
+        undoLastMeasurement();
+    }
+    if (actionReset) {
+        startMeteringSession();
+        uiTriggerBeep(SND_WARN);
+    }
 }

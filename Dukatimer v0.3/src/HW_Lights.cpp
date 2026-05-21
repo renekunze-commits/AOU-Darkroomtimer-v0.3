@@ -1,231 +1,262 @@
-#include <Arduino.h>
-#include <Adafruit_NeoPixel.h>
-#include "Config.h"
-#include "Globals.h"
-
 /*
-  HW_Lights.cpp - Lichtsteuerung mit "Last Action Wins" und Boot-Sync
+  HW_Lights.cpp - Hardware Abstraction Layer (HAL) für Beleuchtung
+  v0.5 Root Cause Edition (DMA & NeoPixelBus)
+  
+  ARCHITEKTUR-REGELN:
+  - KEIN Polling von Schaltern (Das macht HW_Input.cpp via ISR).
+  - KEINE millis() basierten Delays.
+  - REINER Befehlsempfänger (Dumb Executor).
+  - NUTZT NeoPixelBus (DMA/RMT) um CPU-Blockaden zu verhindern.
 */
 
-// Hilfsvariablen für UI Status
-bool statusEnlargerOn = false;
-bool statusSafeOn = false; 
+#include <Arduino.h>
+#include <NeoPixelBus.h>
+#include "Config.h"
+#include "Globals.h"
+#include "DisplayManager.h"
 
-void handleLights() {
-  // Mess-State-Machine hat temporär exklusive Lichtkontrolle.
-  // Wichtig: Kein konkurrierender Pin-Zugriff aus zwei Zustandsmaschinen.
-  if (measurementOverrideActive) return;
+// =============================================================================
+// DMA LED-TREIBER INITIALISIERUNG
+// =============================================================================
+NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> pixels(NEOPIXEL_COUNT, PIN_NEOPIXEL);
 
-  // --- STATISCHE VARIABLEN FÜR FLANKENERKENNUNG ---
-  // Continuous Debounce: Separates Tracking von Rohwert-Flanken (prevRaw*)
-  // und stabilem entprelltem Zustand (lastRaw*). Timer startet bei JEDEM
-  // Flankenwechsel im Rohsignal neu. Erst nach 50ms absoluter Stille
-  // wird der neue Zustand übernommen. Kein Snapshot-Fehler mehr möglich.
-  static int lastRawSafe = -1;    // Letzter stabiler (entprellter) Zustand (-1 = Boot)
-  static int lastRawFocus = -1;
-  static int lastRawRoom = -1;
-  static int prevRawSafe = HIGH;  // Vorheriger Rohwert (Flankenerkennung)
-  static int prevRawFocus = HIGH;
-  static int prevRawRoom = HIGH;
-  static bool lastSafeState = false;
-  static bool lastFocusState = false;
-  static bool lastTimerState = false;
-  static unsigned long safeDebounceMs = 0;
-  static unsigned long focusDebounceMs = 0;
-  static unsigned long roomDebounceMs = 0;
-  
-  // 1. INPUTS LESEN
-  int rawSafe = digitalRead(PIN_SW_SAFE);   // LOW = AN (Input Pullup)
-  int rawFocus = digitalRead(PIN_SW_FOCUS); // LOW = AN (Input Pullup)
-  int rawRoom = digitalRead(PIN_SW_ROOMLIGHT); // LOW = AN (Input Pullup)
-  
-  // A) Safe-Light Schalter (Continuous Debounce, 50ms)
-  if (lastRawSafe == -1) {
-      // BOOT SYNC: Übernehme sofort den physikalischen Zustand!
-      lastRawSafe = rawSafe;
-      prevRawSafe = rawSafe;
-      safeLatch = (rawSafe == LOW); 
-  }
-  else {
-      // Bei jedem Flankenwechsel im Rohsignal: Timer neu starten
-      if (rawSafe != prevRawSafe) {
-          safeDebounceMs = millis();
-          prevRawSafe = rawSafe;
-      }
-      // Erst nach 50ms absoluter Stille neuen Zustand übernehmen
-      if (safeDebounceMs != 0 && (millis() - safeDebounceMs >= 50)) {
-          if (rawSafe != lastRawSafe) {
-              safeLatch = (rawSafe == LOW);
-              lastRawSafe = rawSafe;
-          }
-          safeDebounceMs = 0;
-      }
-  }
+static const TickType_t PIXEL_MUTEX_TIMEOUT = pdMS_TO_TICKS(50);
 
-  // B) Fokus-Licht Schalter (Continuous Debounce, 50ms)
-  if (lastRawFocus == -1) {
-      // BOOT SYNC
-      lastRawFocus = rawFocus;
-      prevRawFocus = rawFocus;
-      whiteLatch = (rawFocus == LOW);
-  }
-  else {
-      if (rawFocus != prevRawFocus) {
-          focusDebounceMs = millis();
-          prevRawFocus = rawFocus;
-      }
-      if (focusDebounceMs != 0 && (millis() - focusDebounceMs >= 50)) {
-          if (rawFocus != lastRawFocus) {
-              whiteLatch = (rawFocus == LOW);
-              lastRawFocus = rawFocus;
-          }
-          focusDebounceMs = 0;
-      }
-  }
+// =============================================================================
+// INTERNE HARDWARE-STATUS (Priority Pipeline)
+// =============================================================================
+static bool reqFocus = false;
+static bool reqSafe = false;
+static bool expActive = false;
+static uint8_t expR = 0, expG = 0, expB = 0;
 
-  // C) Raumlicht Schalter (Continuous Debounce, 50ms)
-  if (lastRawRoom == -1) {
-      // BOOT SYNC
-      lastRawRoom = rawRoom;
-      prevRawRoom = rawRoom;
-      roomLatch = (rawRoom == LOW);
-  }
-  else {
-      if (rawRoom != prevRawRoom) {
-          roomDebounceMs = millis();
-          prevRawRoom = rawRoom;
-      }
-      if (roomDebounceMs != 0 && (millis() - roomDebounceMs >= 50)) {
-          if (rawRoom != lastRawRoom) {
-              roomLatch = (rawRoom == LOW);
-              lastRawRoom = rawRoom;
-          }
-          roomDebounceMs = 0;
-      }
-  }
-
-  // D) Finale Status-Variablen
-  bool swSafe  = safeLatch; 
-  bool swFocus = whiteLatch;
-  bool swRoom  = roomLatch || screenOffOverride;
-  bool timerRunning = (starttime != 0);
-
-  // ------------------------------------------------------------
-  // 2. RELAIS STEUERUNG
-  // ------------------------------------------------------------
-  
-  // Raumlicht
-    if (!swRoom && !timerRunning && !swFocus && !swSafe && !isMeasuring) {
-      digitalWrite(PIN_RELAY_ROOMLIGHT, HIGH); 
-  } else {
-      digitalWrite(PIN_RELAY_ROOMLIGHT, LOW); 
-  }
-
-  // Safe-Light Relais
-  digitalWrite(PIN_RELAY_SAFE, swSafe ? HIGH : LOW);
-
-  // Vergrößerer Relais
-  digitalWrite(PIN_RELAY_ENLARGER, (timerRunning || swFocus) ? HIGH : LOW);
-
-  // ------------------------------------------------------------
-  // 3. MATRIX FARB-MANAGEMENT
-  // ------------------------------------------------------------
-  
-  // FALL 1: TIMER LÄUFT
-  if (timerRunning) {
-      statusEnlargerOn = true; statusSafeOn = false;
-      if (!lastTimerState) { lastTimerState = true; lastSafeState = false; lastFocusState = false; }
-  }
-  
-  // FALL 2: SAFELIGHT
-  else if (swSafe) {
-      lastTimerState = false; statusEnlargerOn = false; statusSafeOn = true;
-      
-      // Safe-Priority: Fokus aus, wenn Safe an
-      if (whiteLatch) whiteLatch = false; 
-      
-      if (neoPixelOK && !lastSafeState) {
-        uint8_t val = (set_safe > 0) ? set_safe : 30; 
-        if (gPixelMutex && xSemaphoreTake(gPixelMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-          pixels.fill(pixels.Color(val, 0, 0));
-          pixels.show();
-          xSemaphoreGive(gPixelMutex);
-        }
-        lastSafeState = true; lastFocusState = false;
-      }
-  }
-  
-  // FALL 3: FOKUS
-  else if (swFocus) {
-      lastTimerState = false; statusEnlargerOn = true; statusSafeOn = false;
-      if (neoPixelOK && !lastFocusState) {
-        if (gPixelMutex && xSemaphoreTake(gPixelMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-          pixels.fill(pixels.Color(set_focus, set_focus, set_focus));
-          pixels.show();
-          xSemaphoreGive(gPixelMutex);
-        }
-        lastFocusState = true; lastSafeState = false;
-      }
-  }
-  
-  // FALL 4: ALLES AUS
-  else {
-      lastTimerState = false; statusEnlargerOn = false; statusSafeOn = false;
-      if (neoPixelOK && (lastSafeState || lastFocusState)) {
-        if (gPixelMutex && xSemaphoreTake(gPixelMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-          pixels.clear(); pixels.show();
-          xSemaphoreGive(gPixelMutex);
-        }
-        lastSafeState = false; lastFocusState = false;
-      }
-  }
+/**
+ * ZENTRALE STATUS-VERWALTUNG:
+ * Synchronisiert die globalen Status-Flags für das LCD-Display.
+ * Das LCD darf nur dann Weißlicht-Helligkeit annehmen, wenn der Vergrößerer 
+ * auch physikalisch leuchtet (Schutz vor Streulicht bei aktivem Safety Latch).
+ */
+static void updateHardwareStatusFlags() {
+    statusSafeOn = reqSafe;
+    statusEnlargerOn = expActive || (reqFocus && !reqSafe); 
 }
 
-// Explizite LED-Modussteuerung für den Flash-Handshake.
-// Wichtig: Diese Funktion steuert nur die NeoPixel-Matrixfarbe und blockiert
-// maximal kurz auf den Pixel-Mutex. Sie ist damit für den Main-Loop geeignet.
-void setLEDMode(uint8_t mode) {
-  measurementOverrideActive = true; // Haupt-State-Machine pausieren
-
-  // Alle relevanten Relais in sicheren Grundzustand bringen.
-  // Raumlicht aus, Safelight aus, Vergrößerer aus.
-  digitalWrite(PIN_RELAY_ROOMLIGHT, LOW);
-  digitalWrite(PIN_RELAY_SAFE, LOW);
-  digitalWrite(PIN_RELAY_ENLARGER, LOW);
-
-  if (!neoPixelOK) return;
-  if (gPixelMutex && xSemaphoreTake(gPixelMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-    switch ((LedMode)mode) {
-      case LED_GREEN:
-        pixels.fill(pixels.Color(0, 255, 0));
-        break;
-      case LED_BLUE:
-        pixels.fill(pixels.Color(0, 0, 255));
-        break;
-      case LED_FOCUS:
-        pixels.fill(pixels.Color(set_focus, set_focus, set_focus));
-        break;
-      case LED_SAFELIGHT: {
-        uint8_t val = (set_safe > 0) ? set_safe : 30;
-        pixels.fill(pixels.Color(val, 0, 0));
-        break;
-      }
-      case LED_OFF:
-      default:
-        pixels.clear();
-        break;
+/**
+ * ZENTRALE RENDER-FUNKTION (SAFETY LATCH EDITION):
+ * Setzt Hardware-Sperren konsequent durch.
+ */
+static void renderNeoPixels() {
+    if (gPixelMutex != NULL && xSemaphoreTake(gPixelMutex, PIXEL_MUTEX_TIMEOUT) == pdTRUE) {
+        if (expActive) {
+            // Priorität 1: Timer-Belichtung läuft (System Override)
+            pixels.ClearTo(RgbColor(expR, expG, expB));
+        } else if (reqSafe) {
+            // Priorität 2: SAFETY LATCH! Safelight hat absolute Priorität.
+            // Blockiert das Fokuslicht zwingend, um offenes Fotopapier zu schützen.
+            uint8_t s = (set_safe > 0) ? set_safe : 30;
+            pixels.ClearTo(RgbColor(s, 0, 0));
+        } else if (reqFocus) {
+            // Priorität 3: Fokus-Einrichtlicht (Weiß). Geht nur an, wenn Safe AUS ist.
+            uint8_t f = (set_focus > 0) ? set_focus : 255;
+            pixels.ClearTo(RgbColor(f, f, f));
+        } else {
+            // Priorität 4: Alles aus
+            pixels.ClearTo(RgbColor(0, 0, 0));
+        }
+        pixels.Show(); 
+        xSemaphoreGive(gPixelMutex);
     }
-    pixels.show();
-    xSemaphoreGive(gPixelMutex);
-  }
 }
 
-// Wrapper für Kompatibilität
-void PaintLED(int r, int g, int b) {
-  if (!neoPixelOK) return;
-  if (gPixelMutex && xSemaphoreTake(gPixelMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    pixels.fill(pixels.Color(r, g, b));
-    pixels.show();
-    xSemaphoreGive(gPixelMutex);
-  }
+void HW_InitLights() {
+    // Hardware-Grounding gegen schwebende "Geister-Signale"
+    pinMode(PIN_SW_FOCUS, INPUT_PULLUP);
+    pinMode(PIN_SW_SAFE, INPUT_PULLUP);
+    pinMode(PIN_SW_ROOMLIGHT, INPUT_PULLUP);
+
+    pixels.Begin();
+    renderNeoPixels(); // Setzt initial alle LEDs sauber auf Schwarz
+}
+
+// =============================================================================
+// 1. BLACKOUT CONTROL (Raumlicht & Displays)
+// =============================================================================
+void HW_SetBlackout(bool active) {
+    isRoomDarknessActive = active;
+    
+    // Relais schalten (LOW zieht Relais an = Dunkelheit)
+    digitalWrite(PIN_RELAY_ROOMLIGHT, active ? LOW : HIGH);
+
+    // Displays absolut synchron dimmen (Verhindert Streulicht)
+    if (active) {
+        DM_setDimming(0);
+    } else {
+        uint8_t current_set_lcd = 100;
+        if (gTimerMutex != NULL && xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            current_set_lcd = set_lcd;
+            xSemaphoreGive(gTimerMutex);
+        } else {
+            current_set_lcd = set_lcd; 
+        }
+        uint8_t nexDim = map(current_set_lcd, 0, 255, 10, 100); 
+        DM_setDimming(nexDim);
+    }
+}
+
+// =============================================================================
+// 2. SAFELIGHT CONTROL (Rotlicht)
+// =============================================================================
+void HW_SetSafelight(bool active) {
+    reqSafe = active;
+    updateHardwareStatusFlags();
+    renderNeoPixels();
+}
+
+// =============================================================================
+// 3. FOCUS CONTROL (Einrichtlicht)
+// =============================================================================
+void HW_SetFocus(bool active) {
+    reqFocus = active;
+    updateHardwareStatusFlags();
+    renderNeoPixels();
+}
+
+// =============================================================================
+// 4. EXPOSURE CONTROL (Belichtung)
+// =============================================================================
+void HW_SetEnlargerNeoPixel(uint8_t r, uint8_t g, uint8_t b) {
+    expR = r; expG = g; expB = b;
+    expActive = (r > 0 || g > 0 || b > 0);
+    updateHardwareStatusFlags();
+    renderNeoPixels();
+}
+
+void HW_EmergencyShutoff() {
+    expR = 0;
+    expG = 0;
+    expB = 0;
+    expActive = false;
+    updateHardwareStatusFlags();
+
+    if (gPixelMutex != NULL && xSemaphoreTake(gPixelMutex, 0) == pdTRUE) {
+        pixels.ClearTo(RgbColor(0, 0, 0));
+        pixels.Show();
+        xSemaphoreGive(gPixelMutex);
+        return;
+    }
+
+    pixels.ClearTo(RgbColor(0, 0, 0));
+    pixels.Show();
+}
+
+// =============================================================================
+// 5. ZYKLISCHES LICHT-UPDATE & SCHALTER-POLLING
+// =============================================================================
+
+// Legacy-Wrapper (Für Abwärtskompatibilität)
+void PaintLED(int r, int g, int b) { 
+    r = constrain(r, 0, 255);
+    g = constrain(g, 0, 255);
+    b = constrain(b, 0, 255);
+    HW_SetEnlargerNeoPixel((uint8_t)r, (uint8_t)g, (uint8_t)b); 
+}
+
+// Physische Schalter einlesen und mit UI kombinieren
+void handleLights() {
+    // FIX A1: Light-Lock - block all light changes during exposure/measurement
+    if (lightOperationActive || isMeasuring) {
+        return;
+    }
+
+    static bool wasBusy = false;
+
+    // 1. CPU entlasten und Hardware-Schalter blockieren, 
+    // wenn der Timer oder das Densitometer gerade das Licht kontrollieren!
+    if (starttime != 0 || isMeasuring) {
+        wasBusy = true; 
+        return; 
+    }
+
+    // 2. Physische Hardware-Schalter einlesen (Low = Aktiviert)
+    // BETA-FIX: Schalter-Zuverlaessigkeit
+    // Die drei Hardware-Schalter werden lokal entprellt, damit kurze
+    // Kontaktpreller/EMV-Spitzen nicht als gueltiger ON-Zustand haengen bleiben.
+    // Dadurch wird insbesondere verhindert, dass Safelight scheinbar "nur noch an"
+    // geht, aber nicht sauber wieder aus.
+    static bool focusRawLast = false, safeRawLast = false, roomRawLast = false;
+    static bool focusSwitch = false, safeSwitch = false, roomSwitch = false;
+    static unsigned long focusRawChangedAt = 0, safeRawChangedAt = 0, roomRawChangedAt = 0;
+    const unsigned long now = millis();
+    const unsigned long SWITCH_DEBOUNCE_MS = 30;
+
+    bool focusRaw = (digitalRead(PIN_SW_FOCUS) == LOW);
+    bool safeRaw  = (digitalRead(PIN_SW_SAFE) == LOW);
+    bool roomRaw  = (digitalRead(PIN_SW_ROOMLIGHT) == LOW);
+
+    if (focusRaw != focusRawLast) { focusRawLast = focusRaw; focusRawChangedAt = now; }
+    if (safeRaw  != safeRawLast)  { safeRawLast  = safeRaw;  safeRawChangedAt  = now; }
+    if (roomRaw  != roomRawLast)  { roomRawLast  = roomRaw;  roomRawChangedAt  = now; }
+
+    if ((now - focusRawChangedAt) >= SWITCH_DEBOUNCE_MS) focusSwitch = focusRaw;
+    if ((now - safeRawChangedAt)  >= SWITCH_DEBOUNCE_MS) safeSwitch  = safeRaw;
+    if ((now - roomRawChangedAt)  >= SWITCH_DEBOUNCE_MS) roomSwitch  = roomRaw;
+
+    // BETA-FIX: Physischer OFF hat Vorrang vor Software-Latches.
+    // Wenn der Nutzer einen der realen Schalter auf AUS setzt, wird der zugehoerige
+    // UI-Latch geloescht. So kann ein historischer Nextion-Latch den Hardware-Schalter
+    // nicht mehr "ueberstimmen" und die Leuchte ungewollt anlassen.
+    if (!safeSwitch)  safeLatch = false;
+    if (!focusSwitch) whiteLatch = false;
+    if (!roomSwitch)  roomLatch = false;
+
+    // 3. Mit den Software-Zuständen (Nextion / UI Latch) kombinieren
+    bool targetSafe  = safeSwitch || safeLatch;
+    bool targetRoom  = roomSwitch || roomLatch;
+
+    // --- ROOT CAUSE FIX: Die Safety Latch Verriegelung ---
+    bool rawFocus = focusSwitch || whiteLatch;
+    static bool lastRawFocus = false;
+    static bool focusTrapLock = false;
+
+    // Wenn Safelight aktiv ist und Fokus NEU eingeschaltet wird, schnappt die Falle zu!
+    if (rawFocus && !lastRawFocus && targetSafe) {
+        focusTrapLock = true;
+        whiteLatch = false; // UI-Software-Button direkt wieder abwerfen!
+    }
+
+    // Die Falle löst sich erst wieder, wenn der Fokus-Schalter physisch auf AUS steht.
+    if (!rawFocus) {
+        focusTrapLock = false;
+    }
+    
+    lastRawFocus = rawFocus;
+
+    // Der finale, gefilterte Fokus-Befehl (Verriegelung blockiert das Signal hart)
+    bool targetFocus = rawFocus && !focusTrapLock;
+
+    // 4. Flankenerkennung: Nur an die Hardware senden, wenn sich etwas ändert!
+    static bool lastFocus = !targetFocus;
+    static bool lastSafe  = !targetSafe;
+    static bool lastRoom  = !targetRoom;
+
+    // Wenn der Timer fertig ist, zwingen wir das System, sich exakt 
+    // auf die aktuellen physikalischen Schalter-Positionen zu synchronisieren!
+    bool forceSync = wasBusy;
+
+    if (forceSync || targetFocus != lastFocus) {
+        HW_SetFocus(targetFocus);
+        lastFocus = targetFocus;
+    }
+
+    if (forceSync || targetSafe != lastSafe) {
+        HW_SetSafelight(targetSafe);
+        lastSafe = targetSafe;
+    }
+
+    if (forceSync || targetRoom != lastRoom) {
+        HW_SetBlackout(targetRoom);
+        lastRoom = targetRoom;
+    }
+
+    wasBusy = false;
 }

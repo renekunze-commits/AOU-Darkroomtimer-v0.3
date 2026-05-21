@@ -1,14 +1,14 @@
 /* HW_Input.cpp - v0.5 Root Cause Edition
    
    ARCHITEKTUR-MAXIME:
+   - Zero-Latency: Interrupt-basierte Erfassung aller Taster.
    - Deterministik: Encoder-Polling über Hardware-Counter (PCNT).
-   - Taster: Absolute Verriegelung (Temporal Lockout) im Realtime-Task.
-     Schützt zu 100% vor Feder-Prellen schwerer mechanischer Schalter.
    - Grounding: Direkte Event-Generierung für die xInputQueue.
 */
 
 #include <Arduino.h>
 #include <ESP32Encoder.h>
+#include "driver/gpio.h"
 #include "Config.h"
 #include "Globals.h"
 #include "Types.h"
@@ -18,9 +18,9 @@
 // =============================================================================
 
 // Encoder-Instanzen (Nutzen ESP32 Hardware Pulse Counter)
-ESP32Encoder encSoft;  // Encoder 1 (Links)
-ESP32Encoder encHard;  // Encoder 2 (Mitte)
-ESP32Encoder encGrade; // Encoder 3 (Rechts)
+ESP32Encoder encSoft;  // Encoder 1 (Links) - Nutzt Zeit
+ESP32Encoder encHard;  // Encoder 2 (Mitte) - Nutzt Split-Hard/Navigation
+ESP32Encoder encGrade; // Encoder 3 (Rechts) - Nutzt Gradation
 ESP32Encoder encMode;  // Encoder 4 (Ganz Rechts) - Master Mode Dial
 
 // Delta-Tracking für Encoder
@@ -29,7 +29,7 @@ static long lastPosHard = 0;
 static long lastPosGrade = 0;
 static long lastPosMode = 0;
 
-// Legacy-Stati für Abwärtskompatibilität
+// Legacy-Stati für Kompatibilität
 BtnState sEnter;
 BtnState sBack;
 BtnState btnStart;
@@ -37,111 +37,178 @@ BtnState btnEnc3;
 BtnState btnRedLed;
 BtnState btnWhiteLed;
 
+// Entprell-Zeitkonstante (ms)
+static constexpr uint32_t DEBOUNCE_MS = 50;
+
 // =============================================================================
-// ROBUSTES TASTER-POLLING (Temporal Lockout / Absolute Sperrzeit)
+// HARDWARE INTERRUPTS (ISRs)
 // =============================================================================
 
-// ROOT CAUSE FIX: 200ms absolute Totzeit (Taubheit) nach jedem Flankenwechsel.
-// Verhindert zu 100% doppelte Start-Events beim Loslassen des Tasters.
-static constexpr uint32_t LOCKOUT_MS = 200; 
+void IRAM_ATTR isr_button_handler(void* arg) {
+    InputEventType type = (InputEventType)(uint32_t)arg;
+    static uint32_t last_fire_ms[16] = {0};
+    uint32_t now = millis();
 
-struct PolledButton {
-    int pin;
-    InputEventType eventType;
-    bool stableState;
-    uint32_t lastEventTime;
-};
+    uint8_t idx = (uint8_t)type;
+    if (idx >= 16) idx = 15;
 
-// Unsere 3 Haupt-Taster, die gepollt werden
-static PolledButton btns[] = {
-    { PIN_SW_ENTER, EVT_ENTER_PRESSED, false, 0 },
-    { PIN_SW_BACK,  EVT_BACK_PRESSED,  false, 0 },
-    { PIN_START,    EVT_START_PRESSED, false, 0 }
-};
-static const int numBtns = 3;
+    if (now - last_fire_ms[idx] > DEBOUNCE_MS) {
+        InputEvent evt;
+        evt.type = type;
+        evt.value = 0;
+        evt.timestamp = now;
+
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(xInputQueue, &evt, &xHigherPriorityTaskWoken);
+        
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
+        last_fire_ms[idx] = now;
+    }
+}
 
 // =============================================================================
 // INITIALISIERUNG
 // =============================================================================
 
 void initInput() {
+    // Sicherstellen, dass alle Encoder-Pins im sauberen Zustand sind
+    gpio_reset_pin((gpio_num_t)ENC_SOFT_A);
+    gpio_reset_pin((gpio_num_t)ENC_SOFT_B);
+    gpio_reset_pin((gpio_num_t)ENC_HARD_A);
+    gpio_reset_pin((gpio_num_t)ENC_HARD_B);
+    gpio_reset_pin((gpio_num_t)ENC_GRADE_A);
+    gpio_reset_pin((gpio_num_t)ENC_GRADE_B);
+    gpio_reset_pin((gpio_num_t)ENC_MODE_A);
+    gpio_reset_pin((gpio_num_t)ENC_MODE_B);
+
     ESP32Encoder::useInternalWeakPullResistors = UP;
-    
-    // ROOT CAUSE FIX: Zurück zum HalfQuad-Modus.
-    // KY-040 Encoder liegen mechanisch oft so, dass SingleEdge
-    // zu verschluckten Erst-Klicks führt.
+
+    // Wieder auf HalfQuad zurückstellen (sorgt für saubere Zustandsübergänge),
+    // da mechanische Raster (Detents) oft 2 halbe Phasen erzeugen.
     encSoft.attachHalfQuad(ENC_SOFT_A, ENC_SOFT_B);
     encHard.attachHalfQuad(ENC_HARD_A, ENC_HARD_B);
     encGrade.attachHalfQuad(ENC_GRADE_A, ENC_GRADE_B);
-    encMode.attachHalfQuad(ENC_MODE_A, ENC_MODE_B);
+    encMode.attachHalfQuad(ENC_MODE_A, ENC_MODE_B); // Der 4. Encoder!
+
+    // Hardware-Debouncing (Glitch Filter im ESP32 PCNT Modul)
+    // Ignoriert Signale, die kürzer als 1023 APB-Ticks (~12.8us) sind.
+    encSoft.setFilter(1023);
+    encHard.setFilter(1023);
+    encGrade.setFilter(1023);
+    encMode.setFilter(1023);
 
     encSoft.setCount(0);
     encHard.setCount(0);
     encGrade.setCount(0);
     encMode.setCount(0);
+    // Taster anbinden
+    // Enc1/2/3 und START werden per Polling in HW_Input_Process() erfasst
+    // (robuste Entprellung + Long-Press). Nur MODE bleibt auf ISR.
+    pinMode(PIN_SW_ENTER, INPUT_PULLUP);
+    pinMode(PIN_SW_BACK, INPUT_PULLUP);
+    pinMode(PIN_SW_GRADE, INPUT_PULLUP);
 
-    // Taster als reine Inputs (mit Pullup) initialisieren. Keine Interrupts mehr!
-    for (int i = 0; i < numBtns; i++) {
-        pinMode(btns[i].pin, INPUT_PULLUP);
-    }
+    pinMode(PIN_SW_MODE, INPUT_PULLUP);
+    attachInterruptArg(PIN_SW_MODE, isr_button_handler, (void*)EVT_MODE_PRESSED, FALLING);
 
-    sEnter.lastState = true;
-    sBack.lastState = true;
-    btnStart.lastState = true;
+    pinMode(PIN_START, INPUT_PULLUP);
+
+    pinMode(PIN_SW_FOCUS, INPUT_PULLUP);
+    pinMode(PIN_SW_SAFE, INPUT_PULLUP);
+    pinMode(PIN_SW_ROOMLIGHT, INPUT_PULLUP);
 }
 
 // =============================================================================
-// INPUT POLLING (Wird exakt alle 1ms vom TaskRealtime auf Core 1 gerufen)
+// ENCODER POLLING + LONG-PRESS DETECTION (Core 1)
 // =============================================================================
 
-void HW_Input_Process() {
-    uint32_t now = millis();
+static constexpr uint32_t LONG_PRESS_MS = 600;
 
-    // 1. DREH-ENCODER AUSLESEN
-    auto pollEncoder = [](ESP32Encoder& enc, long& lastPos, InputEventType type, uint32_t timestamp) {
-        // ROOT CAUSE FIX: Der Software-Teiler (/ 2) wie gestern.
-        // Glättet das mechanische Spiel zwischen den Rastungen zuverlässig aus.
-        long curPos = enc.getCount() / 2; 
-        
+void HW_Input_Process() {
+    // --- Encoder Polling ---
+    auto pollEncoder = [](ESP32Encoder& enc, long& lastPos, InputEventType type) {
+        long rawPos = enc.getCount();
+        long curPos = rawPos / 2; 
         if (curPos != lastPos) {
             InputEvent evt;
             evt.type = type;
             evt.value = (int32_t)(curPos - lastPos);
-            evt.timestamp = timestamp;
+            evt.timestamp = millis();
             xQueueSend(xInputQueue, &evt, 0);
             lastPos = curPos;
         }
     };
 
-    pollEncoder(encSoft,  lastPosSoft,  EVT_ENC_SOFT, now);
-    pollEncoder(encHard,  lastPosHard,  EVT_ENC_HARD, now);
-    pollEncoder(encGrade, lastPosGrade, EVT_ENC_GRADE, now);
-    pollEncoder(encMode,  lastPosMode,  EVT_ENC_MODE, now);
+    pollEncoder(encSoft,  lastPosSoft,  EVT_ENC_SOFT);
+    pollEncoder(encHard,  lastPosHard,  EVT_ENC_HARD);
+    pollEncoder(encGrade, lastPosGrade, EVT_ENC_GRADE);
+    pollEncoder(encMode,  lastPosMode,  EVT_ENC_MODE);
 
-    // 2. TASTER AUSLESEN (Absolute Verriegelung statt wackeligem Edge-Tracking)
-    for (int i = 0; i < numBtns; i++) {
-        bool rawPressed = (digitalRead(btns[i].pin) == LOW); // LOW = Taster gedrückt
+    // --- H02 FIX: Long-Press-Erkennung für Enc1/2/3 Buttons ---
+    static bool btnWasBack = false, btnWasEnter = false, btnWasGrade = false;
+    static uint32_t btnTimeBack = 0, btnTimeEnter = 0, btnTimeGrade = 0;
+    static bool btnLongBack = false, btnLongEnter = false, btnLongGrade = false;
 
-        // Wenn die Sperrzeit (200ms) abgelaufen ist, dürfen wir Statusänderungen akzeptieren
-        if (now - btns[i].lastEventTime > LOCKOUT_MS) {
-            
-            if (rawPressed && !btns[i].stableState) {
-                // Taster wurde GANZ NEU gedrückt
-                btns[i].stableState = true;
-                btns[i].lastEventTime = now; // Sperre (Totzeit) aktivieren!
-                
-                InputEvent evt;
-                evt.type = btns[i].eventType;
-                evt.value = 0;
-                evt.timestamp = now;
+    auto pollLongPress = [](uint8_t pin, bool& wasPressed, uint32_t& pressTime, 
+                            bool& longConsumed, InputEventType shortEvt, InputEventType longEvt) {
+        bool pressed = (digitalRead(pin) == LOW);
+        uint32_t now = millis();
+        if (pressed && !wasPressed) {
+            pressTime = now;
+            longConsumed = false;
+        } else if (pressed && wasPressed && !longConsumed && (now - pressTime) >= LONG_PRESS_MS) {
+            longConsumed = true;
+            InputEvent evt = { longEvt, 0, now };
+            xQueueSend(xInputQueue, &evt, 0);
+        } else if (!pressed && wasPressed) {
+            if (!longConsumed && (now - pressTime) >= DEBOUNCE_MS) {
+                InputEvent evt = { shortEvt, 0, now };
                 xQueueSend(xInputQueue, &evt, 0);
-            } 
-            else if (!rawPressed && btns[i].stableState) {
-                // Taster wurde LOSGELASSEN
-                btns[i].stableState = false;
-                btns[i].lastEventTime = now; // Auch beim Loslassen für 200ms sperren! (Gegen Feder-Prellen)
             }
         }
+        wasPressed = pressed;
+    };
+
+    pollLongPress(PIN_SW_BACK,  btnWasBack,  btnTimeBack,  btnLongBack,  EVT_BACK_PRESSED,  EVT_BACK_LONG);
+    pollLongPress(PIN_SW_ENTER, btnWasEnter, btnTimeEnter, btnLongEnter, EVT_ENTER_PRESSED, EVT_ENTER_LONG);
+    pollLongPress(PIN_SW_GRADE, btnWasGrade, btnTimeGrade, btnLongGrade, EVT_GRADE_PRESSED, EVT_GRADE_LONG);
+
+    // START: stabile Polling-Entprellung + Kurz/Langdruck
+    static bool startStablePressed = false;
+    static bool startLastRawPressed = false;
+    static uint32_t startRawChangedAt = 0;
+    static uint32_t startPressTime = 0;
+    static bool startLongConsumed = false;
+
+    const bool startRawPressed = (digitalRead(PIN_START) == LOW);
+    const uint32_t now = millis();
+
+    if (startRawPressed != startLastRawPressed) {
+        startLastRawPressed = startRawPressed;
+        startRawChangedAt = now;
+    }
+
+    if ((now - startRawChangedAt) >= DEBOUNCE_MS && startStablePressed != startRawPressed) {
+        bool wasStablePressed = startStablePressed;
+        startStablePressed = startRawPressed;
+
+        if (startStablePressed && !wasStablePressed) {
+            startPressTime = now;
+            startLongConsumed = false;
+        } else if (!startStablePressed && wasStablePressed) {
+            if (!startLongConsumed) {
+                InputEvent evt = { EVT_START_PRESSED, 0, now };
+                xQueueSend(xInputQueue, &evt, 0);
+            }
+        }
+    }
+
+    if (startStablePressed && !startLongConsumed && (now - startPressTime) >= LONG_PRESS_MS) {
+        startLongConsumed = true;
+        InputEvent evt = { EVT_START_LONG, 0, now };
+        xQueueSend(xInputQueue, &evt, 0);
     }
 }
 
@@ -153,11 +220,14 @@ bool checkButtonPress(BtnState &st, int pin) {
     unsigned long now = millis();
     bool eventTriggered = false;
 
-    // Nutzt für Legacy-Funktionen ebenfalls eine simple Lockout-Variante
-    if (now - st.lastDebounceTime > 150) {
-        if (currentRaw != st.isPressed) {
+    if (currentRaw != st.lastState) {
+        st.lastDebounceTime = now;
+        st.lastState = currentRaw;
+    }
+
+    if ((now - st.lastDebounceTime) > DEBOUNCE_MS) {
+        if (st.isPressed != currentRaw) {
             st.isPressed = currentRaw;
-            st.lastDebounceTime = now;
             if (st.isPressed) eventTriggered = true;
         }
     }
@@ -167,4 +237,8 @@ bool checkButtonPress(BtnState &st, int pin) {
 bool updateButton(BtnState &st, int pin, unsigned long now) {
     (void)now;
     return checkButtonPress(st, pin);
+
+
+   
+
 }

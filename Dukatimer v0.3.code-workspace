@@ -5,6 +5,12 @@
 		},
 		{
 			"path": "Wireless TSL2591"
+		},
+		{
+			"path": "Timer"
+		},
+		{
+			"path": "Dukatimer v0.9"
 		}
 	],
 	"settings": {}

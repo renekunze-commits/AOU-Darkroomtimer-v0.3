@@ -2,28 +2,28 @@
 #define OUTPUT_H
 
 #include <Arduino.h>
+#include "DukatimerProtocol.h"
 #include "config.h"
 
-// Initialisiert LCD Display und Buzzer
+// Hardware-Initialisierung
 void initOutput();
 
-// Zeigt den Startbildschirm an
+void wakeDisplay();
+void checkDisplaySleep();
+
+// View-Funktionen (Konkrete Screens)
 void showStartup();
+void showError(const char* message);
+void observeRemoteDiagnostic(const dukatimer::protocol::DiagnosticPayload& payload);
+void observeLocalRenderDiagnostics(uint32_t staleRenderCount, uint32_t renderTimeoutCount, bool renderTimeoutActive);
+void renderSlaveMode(const dukatimer::protocol::RemoteDisplayPayload& data);
+void renderRemoteOfflineMode(float lux);
+void renderRemoteMeasurementMode(float lux, bool hardPhase);
+void renderStandAloneMode(float lux);
+float calculateEV(float lux);
 
-// Zeigt eine Fehlermeldung auf dem Display an
-void showError(const char* msg);
-
-// Rendert den vom S3 empfangenen Render-Befehl auf dem LCD
-void renderFromPacket(const ProbeRenderPacket& pkt);
-
-// Zeigt den Standby-Bildschirm (kein aktiver Modus)
-void showStandby(float lastLux, uint32_t seq, bool txOK);
-
-// Sound-Hilfsfunktionen
-void beep(int freq, int duration);
+void triggerHaptic(dukatimer::protocol::RemoteHapticFeedback feedback);
+void serviceOutput();
 void clickSound();
-
-// Haptisches Feedback gemäß ProbeHaptic-Enum
-void playHaptic(uint8_t hapticCode);
 
 #endif

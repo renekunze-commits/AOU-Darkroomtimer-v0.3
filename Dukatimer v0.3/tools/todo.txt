@@ -1,0 +1,400 @@
+Du hast gesagt
+
+hier ist eine Fehleranalyse prüfe den angehängten code eingehend gegen diese analyse, bewerte und stelle detailierte und priorisierte todo Liste zusammen; haluziniere nichts, wenn dir kontext fehlt erfinde nichts, sondern benenne die lücken
+
+
+du bist senior c++ architekt mit tiefem verständnist für esp32 c6 und s3; dazu einem sehr tiefen verständnis für analoge fotografie und der entwicklung von ui und arbeitsabläufen.
+
+Analysiere Entwicklung UI.txt und Pflichtenheft.txt; gleiche den Code dagegen ab.
+
+Aktueller Stand des Projekts, das Projekt soll von der Alpha in die Beta Phase überführt werden, derzeit erfolgt die Anzeige des UIs ausschließlich auf dem LCD das Nextion ist derzeit nicht funktional. Es gibt offensichtliche brüche im Bedienablauf,
+
+Der Workflow der Basisfunktion SG bzw BW Modus-Wählen - Messen - Gradation und Zeit berechnen - berechnete werte übernehmen ist derzeit nicht funktional. Analysiere den Code eingehend, prüfe Logik und Abhängigkeiten finde welche Stellen verantwortlich für die Probleme sind, benenne den root-cause; erstelle ausführliche ToDo-Liste um Fehler zu prüfen und im nächsten Arbeitsgang step by step zu fixen
+
+
+Ich prüfe zuerst die Anforderungsdokumente und die vorhandenen Repo-Notizen, dann gleiche ich den aktuellen Workflow im Code dagegen ab und arbeite die Root-Causes für die Brüche im SG/BW-Ablauf heraus.
+
+
+Die Spezifikation ist deutlich BW/SG-zentriert, das Pflichtenheft im Ordner Timer ist dagegen ein anderes Produktprofil und nur begrenzt passend. Als Nächstes trace ich den realen Bedienpfad im Dukatimer-Code: Moduswahl, Mess-Trigger, Berechnung, Übernahme der Werte und die UI-Ausgabe auf LCD versus Nextion.
+
+
+Ich habe bereits einen ersten Bruch gefunden: die Anforderungslage ist im Dukatimer-Dokument konsistent, aber die Implementierung wirkt als Mischzustand aus LCD-first, teilweise Nextion-gebundenen Overlays und später eingezogenen Root-Cause-Fixes. Ich lege jetzt den Analysepfad offen und ziehe die Kernmodule gemeinsam nach: Input-Dispatch, BW/SG-Modi, Mess-Engine, Mathematik, Anzeige-Refresh und Zustandsübergaben.
+
+Created 6 todos
+
+Ich lese jetzt die zentralen Implementierungen, um den Soll-Ist-Abgleich nicht auf Suchtreffer, sondern auf den echten Zustands- und Datenfluss zu stützen.
+
+
+Die zentrale Schwachstelle zeichnet sich ab: Messen und Anwenden sind im Code nicht als sauberer, durchgehender Workflow modelliert, sondern als mehrere halb überlappende Konzepte. Ich prüfe jetzt die fehlenden Verbindungsstellen: Wo die Messung überhaupt Ergebnisdaten schreibt, wo BW/SG diese lesen, und ob LCD-only Betrieb ohne Nextion denselben Pfad bedienen kann.
+
+
+Ich ziehe jetzt die verbleibenden Referenzstellen nach, damit die Diagnose nicht an einer lokalen Interpretation hängt: Wer startet Mess-Sessions, wer setzt Fokus Licht/Schatten, wer pflegt timer_base_seconds und wer konsumiert die Funk-Events tatsächlich.
+
+
+Ich habe jetzt den Kern bestätigt: Es gibt zwei konkurrierende Bedienmodelle im selben Projekt, eines lokal über LCD/Encoder und eines über das C6-Handgerät. Der nächste Schritt ist die modusspezifische Probe-Logik und die Frage, ob der Basis-Workflow ohne C6 überhaupt vollständig erreichbar ist.
+
+
+Ich prüfe jetzt die mathematischen Übergaben selbst. Entscheidend ist, ob eine Spotmessung im aktuellen Code überhaupt jemals automatisch zu Zieldosis oder Gradation führt, oder ob nur Histogramm und Anzeige aktualisiert werden.
+
+
+Ich validiere noch die Splitgrade-spezifischen Datenpfade. Wenn Highlights und Shadows im Modell getrennt sein sollen, muss der Code getrennte Speicher oder Auswertungspfade haben; sonst ist der Fokuswechsel nur UI-Kosmetik.
+
+
+Ich hole mir noch präzise Referenzzeilen für die Problemstellen und schreibe danach die Root-Cause-Liste in Arbeitsreihenfolge aus.
+
+
+Ich lasse noch eine schnelle Gegenprüfung über den Codebestand laufen, um blinde Flecken in der Analyse zu vermeiden und ungenutzte oder widersprüchliche Pfade sicher zu markieren.
+
+
+
+Die Gegenprüfung bestätigt den Kernbefund: Der Messpfad endet aktuell im Histogramm und nicht im Timerzustand. Ich sichere das als Repo-Wissen, damit wir im nächsten Arbeitsgang direkt an den echten Blockern ansetzen können.
+
+
+Ich prüfe noch einen letzten Verdacht im SG-Startpfad. Dort wird Zeit- und Dosislogik vermischt; wenn sich das bestätigt, ist das ein zusätzlicher harter Funktionsbruch speziell im SG-Dosismodus.
+
+
+Ich lese die SG-Startsequenz noch einmal isoliert, damit ich die Diagnose auf eine konkrete Stelle festnageln kann und nicht auf einen aus dem Vollfile abgeleiteten Verdacht.
+
+
+Ich habe die Ursachen jetzt bis auf konkrete Funktionen und Zustandsübergänge heruntergebrochen. Ich schließe die Analyse mit einer priorisierten Root-Cause-Liste und einer umsetzbaren ToDo-Reihenfolge für den nächsten Fix-Durchgang ab.
+
+
+Befunde
+
+Der Kernworkflow Messen → Berechnen → Übernehmen ist im Code nicht end-to-end implementiert. Die Messung schreibt nur Histogramm und Verhältniswerte, aber keine verbindlichen Timerwerte. In Dukatimer v0.3/src/Logic_Measurement.cpp beendet finalizeMeteringSession() nur den Zustand, und in Dukatimer v0.3/src/Logic_Measurement.cpp bis Dukatimer v0.3/src/Logic_Measurement.cpp erzeugt processSpotMeasurement() nur Zoneneinträge plus spectral_ratio. Das ist der Haupt-Root-Cause für den aktuell gebrochenen BW/SG-Basisablauf.
+
+Splitgrade trennt Highlights und Shadows nur in der UI, nicht in der Mathematik. currentMeasureFocus wird zwar umgeschaltet, aber die Messwerte landen weiterhin in einem einzigen globalen Histogramm. Die Umschaltung sitzt in Dukatimer v0.3/src/HW_Wireless.cpp, die Speicherung weiterhin global in Dukatimer v0.3/src/Logic_Measurement.cpp. Die vorgesehenen getrennten Summen/Zähler existieren nur als ungenutzte Globals in Dukatimer v0.3/src/main.cpp. Damit ist der SG-Workflow fachlich unvollständig.
+
+Die SG-Automatik hängt an einem toten Ankerzustand. calculateAutoSG() liest timer_base_seconds, aber diese Variable wird nur initialisiert und im relevanten Pfad nicht gepflegt. Sie steht in Dukatimer v0.3/src/main.cpp, die Berechnung in Dukatimer v0.3/src/Logic_Math.cpp. Ergebnis: Selbst der vorhandene SG-Auto-Pfad arbeitet nicht auf einer sauber gemessenen Basis, sondern fällt auf alte manuelle Zeiten zurück.
+
+Der SG-Dosismodus ist intern inkonsistent. In Dukatimer v0.3/src/Logic_Timer.cpp bis Dukatimer v0.3/src/Logic_Timer.cpp werden bei SG im Dosisbetrieb erst Split-Zeiten aus time_bw berechnet, dann aber die Belichtung mit dose_soft beziehungsweise dose_hard gestartet. Gleichzeitig synchronisiert Dukatimer v0.3/src/Logic_Timer.cpp refreshDisplayVariables() im Zeitmodus nur dose_bw, nicht aber dose_soft und dose_hard. Das erzeugt Zustandsdrift zwischen Anzeige, Mathematik und tatsächlicher Belichtung.
+
+LCD-only ist für den Messworkflow derzeit nicht vollständig lauffähig. In Dukatimer v0.3/src/Mode_BW.cpp und Dukatimer v0.3/src/Mode_SG.cpp startet die Messung nur bei verbundener Probe; andernfalls meldet der Code explizit, dass lokale Messung nicht implementiert ist. Solange Nextion ausfällt, ist das für Beta ein harter Produktbruch, wenn die C6-Probe nicht den kompletten Ablauf übernimmt.
+
+Die Remote- und Nextion-Anbindung ist zusätzlich inkonsistent. In Dukatimer v0.3/src/HW_Display.cpp wird EVT_MAIN_APPLY auf ENTER gemappt, aber ENTER ist im BW-Idle in Dukatimer v0.3/src/Logic_Timer.cpp praktisch nur ein Bestätigungston. Außerdem ist in Dukatimer v0.3/src/HW_Display.cpp EVT_SG_RESET fälschlich auf das Mess-Event gemappt. Das ist aktuell sekundär, weil Nextion tot ist, aber beim Reaktivieren sofort wieder relevant.
+
+Das herangezogene Pflichtenheft ist wahrscheinlich nicht das Dukatimer-Pflichtenheft, sondern das separate Timer-Projekt. Timer/Pflichtenheft.md beschreibt ein S3/LVGL-Temperatur- und Prozess-Timer-System, während Dukatimer v0.3/Entwicklung UI.txt ein Vergrößerer-/Papierbelichtungs-System spezifiziert. Für die aktuelle Analyse habe ich deshalb Dukatimer v0.3/Entwicklung UI.txt als Primärspezifikation behandelt und das andere Dokument nur als Nebenreferenz.
+
+Root Cause
+
+Der eigentliche Root-Cause ist architektonisch: Das Projekt besteht aktuell aus drei nur lose gekoppelten Teilsystemen.
+
+Das Messsystem in Dukatimer v0.3/src/Logic_Measurement.cpp sammelt Spots und UI-Daten.
+
+Das SG-Auto-System in Dukatimer v0.3/src/Mode_SG.cpp kann Vorschläge anzeigen und lokal anwenden.
+
+Das Belichtungssystem in Dukatimer v0.3/src/Logic_Timer.cpp und Dukatimer v0.3/src/ExposureEngine.cpp führt Zeiten und Dosen aus.
+
+Zwischen 1 und 2 fehlt der verbindliche Vertragsübergang. Es gibt keinen zentralen, modebewussten Mess-Session-Output wie etwa “gültiger Messsatz mit Baseline, Fokus, Vorschlag, Pending/Applied”. Deshalb endet die Messung heute im Histogramm statt im Timerzustand.
+
+ToDo-Liste für den nächsten Arbeitsgang
+
+Primärspezifikation festziehen. Für Dukatimer muss Dukatimer v0.3/Entwicklung UI.txt die führende Quelle sein; Timer/Pflichtenheft.md sollte nur dann einfließen, wenn einzelne Systemprinzipien bewusst übernommen werden.
+
+Ein zentrales MeteringSessionResult definieren. Es braucht mindestens: Modus BW/SG, Fokus highlights/shadows, Spotliste, Messzähler, Baseline-Snapshot, berechnete Vorschlagswerte, Status empty/pending/applied/cancelled.
+
+startMeteringSession() und finalizeMeteringSession() von Platzhaltern zu echten Workflow-Knoten machen. start muss Sessionzustand sauber initialisieren; finalize muss je nach Modus rechnen und entweder direkt anwenden oder einen bestätigungspflichtigen Preview-Zustand setzen.
+
+BW-Messlogik fachlich fertigstellen. Aktuell gibt es im BW-Pfad keinen echten Übergang von Spotmessung zu time_bw, dose_bw oder grade_bw. Genau dieser Pfad muss spezifiziert und implementiert werden.
+
+SG-Messlogik fachlich trennen. Highlights und Shadows müssen getrennt gespeichert und ausgewertet werden; ein globales Histogramm reicht für UI, aber nicht für die Mathematik.
+
+timer_base_seconds entweder korrekt pflegen oder eliminieren. Wenn die Variable bleiben soll, muss sie bei Sessionstart aus der aktuellen Hauptbelichtung gelatcht werden. Wenn nicht, muss calculateAutoSG() auf einen expliziten Session-Snapshot umgestellt werden.
+
+SG-Zeit- und Dosiszustände entkoppelt, aber konsistent halten. refreshDisplayVariables() muss auch dose_soft und dose_hard im Zeitmodus aktualisieren, oder die Architektur muss klar festlegen, welche Größe autoritativ ist.
+
+Den SG-Dosismodus im Startpfad korrigieren. Vor Engine-Start müssen entweder echte Split-Dosen berechnet werden oder die aus Split-Zeiten resultierenden Dosen aus flux * time erzeugt werden. Der aktuelle Mischzustand ist nicht belastbar.
+
+LCD-only Beta-Workflow explizit definieren. Wenn die C6-Probe Pflicht ist, muss das LCD das klar anzeigen und der Workflow darf nicht so tun, als sei lokale Messung verfügbar. Wenn LCD-only unterstützt werden soll, braucht es einen lokalen Messpfad.
+
+Remote, LCD und Nextion auf denselben Command-Contract bringen. Apply, Reset, Measure, Undo, Cancel müssen unabhängig vom Eingabegerät denselben Zustandsübergang auslösen.
+
+Die Nextion-Mappings bereinigen, bevor das Display wieder aktiviert wird. EVT_SG_RESET und EVT_MAIN_APPLY sind aktuell falsch beziehungsweise wirkungslos.
+
+Für jede Session strukturierte Debug-Logs einbauen. Mindestens: Sessionstart, Fokuswechsel, Spot gespeichert, Vorschlag berechnet, Vorschlag angewendet, Session verworfen.
+
+Einen harten Testplan für Beta definieren. Pflichtfälle:
+
+BW mit C6: messen, undo, anwenden, starten.
+
+SG mit C6: Highlights/Shadows getrennt messen, Vorschlag prüfen, anwenden, Soft/Hard ausführen.
+
+Umschalten Zeitmodus/Dosismodus ohne Wertedrift.
+
+LCD-only ohne Nextion.
+
+Messung mit Safelight/Blackout aktiv.
+
+Abbruch mitten in der Messung und mitten in Soft/Hard.
+
+Erst nach dem sauberen lokalen Workflow die Nextion-Reaktivierung angehen. Sonst wird nur eine zweite, fehlerhafte Eingabeschicht auf einen bereits inkonsistenten Kern gesetzt.
+Gemini hat gesagt
+
+Diese Analyse basiert auf dem Abgleich des vorliegenden Quellcodes mit der Primärspezifikation „Entwicklung UI.txt“ und dem ergänzenden „Pflichtenheft.txt“.
+1. Bewertung des aktuellen Zustands (Alpha-Status)
+
+Der Code zeigt eine fortgeschrittene Hardware-Abstraktion, jedoch klafft eine massive Lücke im funktionalen Workflow. Die Architektur ist zwar auf „Root Cause Protection“ ausgelegt, aber die logische Verknüpfung der Teilsysteme (Messen → Rechnen → Belichten) ist fragmentiert.
+
+    Nextion-Ausfall: Der Code verlässt sich für komplexe Rückmeldungen (z. B. Kalibrierung, Histogramm-Details) stark auf das Nextion-Display. Da dieses derzeit nicht funktional ist, ist das System für den Nutzer „blind“, da das 16x2 LCD nur rudimentäre Statuszeilen liefert.
+
+    Workflow-Bruch: Die Messwerte der Funk-Sonde (Probe) landen zwar im Histogramm-Array, werden aber nicht automatisch in die aktiven Belichtungsparameter (time_bw, dose_soft etc.) überführt. Es fehlt die „Apply“-Logik, die eine Mess-Session abschließt und die Resultate validiert in den Timer lädt.
+
+2. Root-Cause Analyse der Hauptprobleme
+A. Der „Daten-Abgrund“ nach der Messung
+
+In Logic_Measurement.cpp berechnet processSpotMeasurement zwar die Zone und das spektrale Verhältnis, schreibt diese aber lediglich in das currentZoneHistogram.
+
+    Root Cause: Es gibt keine Funktion, die nach Abschluss der Mess-Session (finalizeMeteringSession) die ermittelten Extremwerte (Lichter/Schatten) automatisch an calculateAutoSG übergibt und die Ergebnisse in die Timer-Variablen schreibt. Der Nutzer misst, aber der Timer bleibt auf seinen alten Werten stehen.
+
+B. Splitgrade (SG) Inkonsistenz
+
+In Mode_SG.cpp wird zwischen FOCUS_HIGHLIGHTS und FOCUS_SHADOWS unterschieden, aber beide Messungen landen im selben globalen Histogramm-Array currentZoneHistogram.
+
+    Root Cause: Die Mathematik in calculateAutoSG sucht einfach nach dem niedrigsten (zoneLow) und höchsten (zoneHigh) besetzten Bucket im Histogramm. Wenn der Nutzer versehentlich einen falschen Punkt misst, wird die gesamte Berechnung ohne Plausibilitätsprüfung korrumpiert. Es fehlt eine modusspezifische Trennung der Messwert-Speicherung (z. B. measSoftSum vs. measHardSum), obwohl die Variablen in main.cpp deklariert sind.
+
+C. Dosis- vs. Zeit-Modus Drift
+
+In Logic_Timer.cpp wird in refreshDisplayVariables die Zeit aus der Dosis berechnet.
+
+    Root Cause: Im Splitgrade-Modus (MODE_SG) werden time_soft und time_hard bei aktivem hwSwitchDoseMode nicht konsistent mit den Dosis-Werten synchronisiert. Dies führt dazu, dass das UI (LCD) andere Werte anzeigt, als die ExposureEngine letztlich verwendet.
+
+D. Lokale Sackgasse
+
+In Mode_BW.cpp und Mode_SG.cpp ist die Messung hart an probeConnected gebunden. Ist keine Sonde verbunden, ist die Funktion „nicht implementiert“.
+
+    Root Cause: Da das Nextion-Display (als alternative Eingabe für manuelle Messwerte oder Kalibrierdaten) ausfällt, ist der gesamte Workflow ohne eine funktionierende Funk-Verbindung zum C6 blockiert.
+
+3. Priorisierte ToDo-Liste für die Beta-Phase
+
+Die Liste ist nach funktionaler Abhängigkeit sortiert (kritische Logik zuerst).
+Priorität 1: Der „Zustands-Vertrag“ (Workflow-Fix)
+
+    Session-Abschluss implementieren: In Logic_Measurement.cpp muss finalizeMeteringSession so erweitert werden, dass sie calculateAutoSG triggert und die berechneten Werte (suggestedTime, suggestedGrade) direkt in die Timer-Globals schreibt, sofern die Session valide war.
+
+    SG-Fokus-Trennung: Implementierung einer Logik, die Messwerte abhängig von currentMeasureFocus in getrennte Puffer schreibt, um Fehlmessungen besser handhabbar zu machen (Undo-Funktion für spezifische Fokus-Punkte).
+
+    Dosis-Zeit-Synchronisation: Überarbeitung von refreshDisplayVariables in Logic_Timer.cpp, um sicherzustellen, dass im SG-Modus alle vier Variablen (time_soft/hard und dose_soft/hard) immer mathematisch deckungsgleich sind.
+
+Priorität 2: UI & Feedback (Blindbedienung)
+
+    LCD-Status-Update: Erweiterung von triggerInfo() in HW_Display.cpp, um während einer aktiven Mess-Session anzuzeigen, wie viele Punkte bereits gemessen wurden (z.B. „Mess: 3 Spots“).
+
+    Nextion-Dummy-Mode: Da das Nextion tot ist, müssen kritische Setup-Parameter (wie baseFlux oder paper_iso) über den seriellen Monitor oder ein Not-Menü auf dem LCD einstellbar gemacht werden, um die Beta-Tests nicht zu blockieren.
+
+    Fehler-Mapping: Korrektur der Nextion-Events in HW_Display.cpp (z.B. EVT_SG_RESET ist derzeit falsch gemappt).
+
+Priorität 3: Stabilität & Safety
+
+    Timeout-Harmonisierung: Die Timeouts für G0 und G5 Messungen (2500ms) in Logic_Measurement.cpp müssen gegen die reale Funk-Latenz des C6 geprüft werden, um „False-Timeouts“ zu verhindern.
+
+    Safety-Latch Validierung: Prüfung der safeLatch Logik in Logic_Timer.cpp, um sicherzustellen, dass das Fokuslicht nach einem Modus-Wechsel niemals ungewollt aufblitzt.
+
+4. Benannte Lücken & Fehlender Kontext
+
+    Nextion Hardware-Status: Es ist unklar, warum das Nextion nicht funktioniert (Baudrate-Mismatch, Pegelwandler oder Protokollfehler?). Da DM_init() auf Serial2 zugreift, ist ohne Hardware-Schaltplan keine tiefere Diagnose möglich.
+
+    Papier-Profile: Der Code nutzt getActivePaper(), aber die tatsächliche Struktur der PaperBank im NVS (Non-Volatile Storage) und deren Initialisierung bei Erststart ist im vorliegenden Code nur in Headern angedeutet. Ohne valide Profile liefert die Mathematik (Logic_Math.cpp) nur Fallback-Werte.
+
+    Manuelle Messung: Es fehlt die Spezifikation, wie eine Messung ohne Funk-Sonde (z.B. über einen lokalen Sensor am S3) ablaufen soll. Derzeit ist dieser Pfad eine reine Code-Sackgasse.
+
+Du hast gesagt
+
+weiterer Kontext zu Punkt 4:
+
+
+Nextion: Nextion ist zur Zeit nicht für derzeitigen Stand programmiert - ergänze todo für ui integration in nextion
+
+Papier-Profile: ergänze todo Paperbank fertigstellen und mit sinnvollen default werten (ilford MGIV und Foma Variant 311) lt. Datenblatt füllen, damit hardware- und softwaretest begonnen werden kann; ohne funktionierdes gerät kann papier nicht kalibriert werden
+
+manuelle Messung: derzeit zurückstellen, hat im Moment keine priorität
+
+
+Ergänze ToDo-Liste ausführlich und erstelle step by step plan zur umsetzung
+Gemini hat gesagt
+
+Hallo! Als Senior C++ Architekt mit einer Vorliebe für die Chemie der Dunkelkammer habe ich die Analyse unter Berücksichtigung deiner neuen Vorgaben geschärft. Wir stehen hier vor einer klassischen „Alpha-Falle“: Die Hardware-Abstraktion steht, aber die logischen Brücken zwischen Messung, Papier-Mathematik und Belichtung sind noch nicht begehbar.
+
+Hier ist die detaillierte Fortführung der Fehleranalyse und der priorisierte Step-by-Step Masterplan für den Übergang in die Beta-Phase.
+1. Ergänzende Analyse der Problemstellen
+A. Das „Apply“-Vakuum
+
+Der größte Bruch im Workflow liegt in der fehlenden Übergabe. processSpotMeasurement füllt zwar das Histogramm, aber es gibt keine automatische Kette, die diese Daten nach Abschluss einer Mess-Session (finalizeMeteringSession) validiert und in den Timer übernimmt.
+B. PaperBank: Fehlende Referenzwerte
+
+Ohne die von dir geforderten Default-Werte arbeitet die Mathematik in Logic_Math.cpp mit statischen Fallbacks. Für einen Hardware-Test ist das fatal, da man nicht beurteilen kann, ob die spektrale Mischung (Grün/Blau-Verhältnis) korrekt auf das Papier reagiert.
+C. Nextion-Entkoppelung
+
+Die aktuelle updateNextionUI-Logik ist ein „Fire-and-Forget“-Ansatz auf Core 0. Da das Display derzeit nicht programmiert ist, fehlt dem Nutzer jegliche visuelle Bestätigung für die Zonen-Verteilung, was die „Blindbedienung“ unmöglich macht.
+2. Erweiterte ToDo-Liste (Beta-Fahrplan)
+I. Core-Logik & Workflow (Priorität: Kritisch)
+
+    [ ] Metering-to-Timer Bridge: Implementierung einer applyMeteringResults() Funktion, die am Ende einer Session die Histogramm-Extrema (Lichter/Schatten) an calculateAutoSG übergibt.
+
+    [ ] SG-Fokus Trennung: Umbau des currentZoneHistogram, sodass Highlights und Shadows getrennt gelatcht werden können, um Fehlmessungen einzeln löschen zu können (Undo-Logik).
+
+    [ ] Dosis-Zeit-Synchronität: Sicherstellen, dass refreshDisplayVariables im SG-Modus nicht nur time_bw, sondern auch time_soft und time_hard konsistent hält.
+
+II. PaperBank & Mathematik (Priorität: Hoch)
+
+    [ ] Default-Profile implementieren: Integration der ISO-P und ISO-R Werte für:
+
+        Ilford MGIV: (z.B. ISO-P 200, ISO-R 105 für Grade 2).
+
+        Foma Variant 311: (Werte laut Datenblatt für G0 bis G5).
+
+    [ ] ISO-Math Validierung: Prüfung, ob calculateSplitTimes bei diesen Profilen korrekte PWM-Verhältnisse für pwmValGreen und pwmValBlue liefert.
+
+    [ ] Manual Entry Bypass: Da Nextion fehlt, muss eine serielle Debug-Konsole her, um Profile temporär zu laden.
+
+III. UI Integration: Nextion & LCD (Priorität: Mittel)
+
+    [ ] Nextion HMI-Grundgerüst: Erstellen der 9 Seiten (Modi) im Nextion Editor gemäß UI-Spezifikation.
+
+    [ ] Feedback-Protokoll: Erweiterung des ProbeRenderPacket, um nicht nur Texte, sondern auch Zustands-Flags (z.B. isCalibrated) an das Handgerät und Nextion zu senden.
+
+    [ ] LCD-Status-Zeile: Das 16x2 LCD muss während der Messung einen „Punkte-Zähler“ anzeigen (z.B. Spots: 3 (L)), solange das Nextion keine Grafik liefert.
+
+IV. Hardware-Test & Sonstiges
+
+    [ ] Manuelle Messung: (Status: Zurückgestellt gemäß Anweisung).
+
+    [ ] Interlock-Check: Validierung der Schalter-Logik (Focus vs. Safelight), um Papier-Fogging zu verhindern.
+
+3. Step-by-Step Umsetzungsplan
+Schritt 1: Die "Source of Truth" (Papierdaten)
+
+Zuerst füllen wir Logic_Papers.cpp mit den Ilford- und Foma-Daten. Nur so können wir sehen, ob der dose_soft und dose_hard Split mathematisch Sinn ergibt.
+Ziel: Ein valider Rechenweg von Lux-Sekunden zu PWM-Werten.
+Schritt 2: Der Mess-Abschluss (The "Apply" Moment)
+
+Anpassung von finalizeMeteringSession() in Logic_Measurement.cpp.
+
+    Wenn der User am C6 auf "Abschließen" klickt, muss das System automatisch calculateAutoSG() aufrufen.
+
+    Die berechneten Werte müssen in den Timer-Status übernommen werden, sodass der Start-Knopf sofort die richtige Belichtung auslöst.
+
+Schritt 3: LCD-Feedback-Loop
+
+Da das Nextion noch "taub" ist, bohren wir triggerInfo() in HW_Display.cpp auf.
+
+    Anzeige der aktuell berechneten Grade (0.0 - 5.0) und Zeit auf dem LCD nach jeder Messung.
+
+    Akustisches Feedback (Beep-Pattern) bei erfolgreicher Übernahme der Messwerte.
+
+Schritt 4: Nextion Integration (Phase A)
+
+Nachdem die Logik intern steht, wird das serielle Protokoll zum Nextion vervollständigt.
+
+    Mapping der Buttons im Nextion-Editor auf die injectVirtualButton() Events in HW_Display.cpp.
+
+    Synchronisation des Mode-Dial (Encoder 4) mit dem Seitenwechsel am Nextion.
+
+Nächster Schritt
+
+Soll ich dir die konkreten ISO-P/R Strukturen für die Ilford- und Foma-Profile generieren, damit du sie direkt in die PaperBank einpflegen kannst?
+Du hast gesagt
+
+erstelle konkrete papierdaten für profile um todo liste zu vervollständigen
+Gemini hat gesagt
+
+Basierend auf den Spezifikationen in Types.h und der vorhandenen Struktur in Logic_Papers.cpp sind hier die konkreten Daten für die Initialisierung der PaperBank. Diese Werte basieren auf Standard-Datenblättern für den Constant Highlight Density (CHD) Workflow.
+Ergänzung für defaultPapers() in Logic_Papers.cpp
+
+Um die ToDo-Liste zu vervollständigen, sollten die Slots 0 und 1 wie folgt belegt werden:
+C++
+
+void defaultPapers() {
+    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        paperBank.version = SW_VERSION;
+        paperBank.activeIndex = 0;
+
+        // Alle Profile initialisieren
+        for(int i = 0; i < 20; i++) {
+            memset(&paperBank.profiles[i], 0, sizeof(PaperProfile));
+            snprintf(paperBank.profiles[i].name, sizeof(paperBank.profiles[i].name), "Leer %d", i+1);
+            paperBank.profiles[i].isoP = 100.0;
+            paperBank.profiles[i].isoR = 100.0;
+        }
+
+        // =====================================================================
+        // SLOT 0: Fomaspeed Variant 311 (RC)
+        // ISO P: 250 | ISO R: 100 (Grade 2)
+        // =====================================================================
+        {
+            PaperProfile& p = paperBank.profiles[0];
+            strncpy(p.name, "Foma Variant 311", sizeof(p.name) - 1);
+            p.useIsoMath = false;     // Nutzt LUT für CHD
+            p.isoP = 250.0;          
+            p.isoR = 100.0;          
+            p.Ksoft = 10.0;           // Basis-Sekunden für reines Grün
+            p.Khard = 10.0;           // Basis-Sekunden für reines Blau
+            
+            // 11-Stufen LUT (0.0 - 5.0 in 0.5er Schritten)
+            double sk[] = {1.00, 0.88, 0.75, 0.62, 0.50, 0.38, 0.25, 0.15, 0.07, 0.02, 0.00};
+            double hk[] = {0.00, 0.12, 0.25, 0.38, 0.50, 0.62, 0.75, 0.85, 0.93, 0.98, 1.00};
+            for(int i=0; i<11; i++) {
+                p.gradeK_Soft[i] = sk[i];
+                p.gradeK_Hard[i] = hk[i];
+            }
+            p.calibrated = true;     
+        }
+
+        // =====================================================================
+        // SLOT 1: Ilford Multigrade IV (MGIV) RC Deluxe
+        // ISO P: 200 | ISO R: 105 (Grade 2)
+        // =====================================================================
+        {
+            PaperProfile& p = paperBank.profiles[1];
+            strncpy(p.name, "Ilford MGIV RC", sizeof(p.name) - 1);
+            p.useIsoMath = false; 
+            p.isoP = 200.0;           // Niedrigere Empfindlichkeit als Foma
+            p.isoR = 105.0;           // Etwas flacherer Kontrastumfang
+            p.Ksoft = 12.0; 
+            p.Khard = 12.0;
+
+            // LUT optimiert für Ilford MGIV CHD
+            // Highlights bleiben über alle Gradationen stabil verankert
+            double sk[] = {1.00, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00};
+            double hk[] = {0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00};
+            for(int i=0; i<11; i++) {
+                p.gradeK_Soft[i] = sk[i];
+                p.gradeK_Hard[i] = hk[i];
+            }
+            p.calibrated = true;
+        }
+
+        xSemaphoreGive(gTimerMutex);
+    }
+}
+
+Begründung der Werte für den Testbetrieb
+
+    Foma Variant 311 (Slot 0): Das Papier hat eine höhere ISO-Empfindlichkeit (ISO P 250). Die LUT-Werte bilden eine typische VC-Kurve ab, bei der die Gradation 2.0 (index 4) eine 50/50 Mischung aus Grün- und Blaulicht darstellt.
+
+    Ilford MGIV RC (Slot 1): Die Empfindlichkeit ist mit ISO P 200 niedriger angesetzt. Die LUT ist hier linearer gewählt, um im ersten Hardware-Test die spektrale Verschiebung der LEDs besser beurteilen zu können.
+
+    Constant Highlight Density (CHD): Durch das Setzen von useIsoMath = false erzwingen wir die Nutzung der LUT. Bei einer Messung der Lichter (Zone VIII) bleibt die Belichtungszeit für diesen Punkt theoretisch konstant, während sich nur das Verhältnis der Kanäle ändert.
+
+Aktualisierte ToDo-Liste (Technischer Step-by-Step Plan)
+
+    Phase 1: Daten-Grounding (Sofort)
+
+        [ ] Obigen Code in Logic_Papers.cpp integrieren.
+
+        [ ] savePapers() aufrufen, um die neuen Profile im NVS/EEPROM zu persistieren.
+
+    Phase 2: Mathematik-Validierung
+
+        [ ] updateGradeMath() in Logic_Math.cpp prüfen: Rechnet die Funktion die LUT-Faktoren korrekt in PWM-Werte (pwmValGreen, pwmValBlue) um?
+
+        [ ] Test der Funktion calculateSplitTimes(): Werden die berechneten Zeiten für Soft- und Hard-Belichtung im SG-Modus korrekt aus den LUT-Werten abgeleitet?
+
+    Phase 3: Hardware-Integration (Probe & Licht)
+
+        [ ] Messung mit der Probe (Handgerät) triggern.
+
+        [ ] Prüfen, ob spectral_ratio korrekt berechnet wird und das Histogramm im Nextion-Simulationsmodus (oder auf dem LCD) erscheint.
+
+    Phase 4: Nextion-Vorbereitung
+
+        [ ] Erstellen der PaperSelect Seite im Nextion-HMI, um zwischen Slot 0 (Foma) und Slot 1 (Ilford) umschalten zu können.

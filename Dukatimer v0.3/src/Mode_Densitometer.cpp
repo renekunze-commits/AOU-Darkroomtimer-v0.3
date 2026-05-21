@@ -1,224 +1,271 @@
-/* Mode_Densitometer.ino - Densitometer & Film-Test
-
-   Beschreibung:
-   - Misst relative Lichtintensitäten und berechnet optische Dichte D = log10(Ref / Meas).
-   - Unterstützt einen REF-Calibration-Schritt (A=calibrate) und kontinuierliche Messung (B=meas).
-   - Zeigt optional Netto-Dichte gegen eine zuvor gesetzte Base-Fog an.
-   - Werte in Lux, D ist dimensionslos (optische Dichte, logarithmisch)
+/*
+    Mode_Densitometer.cpp - v0.5 Root Cause Edition
+    
+    Zweck: Messung der optischen Dichte mit Dunkelstrom-Kompensation
+           (D = log10((Ref - Dark) / (Meas - Dark))).
+    
+    Änderungen v0.5:
+    - Vollständige Core-Isolation (Läuft auf Core 1).
+    - I2C-Schutz via xI2CMutex für TSL2591 Zugriffe.
+    - Asynchrones Input-Handling via xInputQueue.
+    - Shadow-Display Integration zur Vermeidung von Jitter.
+    - NEU: Dark Current Kalibrierung getrennt für baseDarkLux (TSL2591).
 */
+
 #include <Arduino.h>
+#include <math.h>
 #include "Globals.h"
 #include "Config.h"
+#include "DisplayManager.h"
+#include "Logic_Measurement.h"
+#include "Logic_Timer.h"
+#include "Logic_Storage.h" // Für saveSettings()
 
-// Externe Abhängigkeiten
-extern void smartLCD(const char* l1, const char* l2);
-extern void PaintLED(int r, int g, int b);
-extern void beepOk();
-extern void beepValue();
-extern void beepWarnLong();
+extern void updateNextionUI(bool force);
 
-// Helper
-static Mode prevMode = MODE_SG;
+// Lokaler Status
 static unsigned long densMsgUntil = 0;
-static bool densMeasBusy = false;  // Async Messung laeuft
+static bool densAbort = false;
+static float liveLux = 0.0;
+static uint8_t idleMenuIdx = 0; // 0 = Normal, 1 = Dark Calib
 
-void enterDensMode() {
-  prevMode = currentMode;
-  currentMode = MODE_DENS;
-  densState = DENS_IDLE;
-  densRefLux = 0.0;
-  densBaseFog = NAN; // Reset Base Fog
-
-  PaintLED(0, 0, 0);
-  lcd.clear();
-  lcd.print("DENSITOMETER");
-  densMsgUntil = millis() + 800; // non-blocking
+void startDensitometerMode() {
+    densState = DENS_IDLE;
+    densRefLux = 0.0;
+    densBaseFog = NAN; 
+    densAbort = false;
+    idleMenuIdx = 0;
+    densMsgUntil = millis() + 1000;
+    
+    uiUpdateLCD("DENSITOMETER", "Mode Started");
+    uiTriggerBeep(SND_OK);
+    updateNextionUI(true);
 }
 
-void exitDensMode() {
-  currentMode = prevMode;
-  PaintLED(0, 0, 0);
-  lcd.clear();
-  lcd.print("EXIT DENS...");
-  densMsgUntil = millis() + 600; // non-blocking
+/**
+ * Hilfsfunktion zum sicheren Auslesen des TSL2591 (Base Sensor)
+ */
+static float getSafeLiveLux() {
+    float result = 0.0;
+    if (!tslBaseOK) return 0.0;
+
+    if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        uint32_t lum = tslBase.getFullLuminosity();
+        uint16_t ir = lum >> 16;
+        uint16_t full = lum & 0xFFFF;
+        result = (float)tslBase.calculateLux(full, ir);
+        xSemaphoreGive(xI2CMutex);
+    }
+    return result;
 }
 
-void runDensitometerLoop(char key) {
-  // --- Async-Messung ticken (non-blocking) ---
-  if (densMeasBusy) {
-    if (tickAsyncSpot()) {
-      densMeasBusy = false;
-      double avg = getAsyncSpotResult();
-      isMeasuring = false;
-      handleLights();
-      if (avg > 0.1) {
-         densRefLux = avg;
-         densState = DENS_IDLE;
-         beepOk();
-         smartLCD("REF SAVED", String(densRefLux, 2) + " lx");
-         densMsgUntil = millis() + 1000;
-      } else {
-         beepWarnLong();
-         smartLCD("TOO DARK", "Light on?");
-         densMsgUntil = millis() + 800;
-      }
+void runDensitometerWizard() {
+    wdt_reset();
+
+    // 1. UI-Pause abwarten
+    if (millis() < densMsgUntil) return;
+
+    // 2. Input konsumieren
+    InputEvent evt;
+    bool startPressed = false;
+    bool backPressed = false;
+    bool enterPressed = false;
+    int encDelta = 0;
+
+    while (xQueueReceive(xInputQueue, &evt, 0) == pdTRUE) {
+        if (evt.type == EVT_START_PRESSED) startPressed = true;
+        if (evt.type == EVT_GRADE_PRESSED) backPressed = true;
+        if (evt.type == EVT_ENTER_PRESSED) enterPressed = true;
+        if (evt.type == EVT_ENC_SOFT || evt.type == EVT_ENC_HARD) encDelta += evt.value;
     }
-    // Waehrend Messung nur Abort erlauben
-    if (key == '*') {
-      cancelAsyncSpot();
-      densMeasBusy = false;
-      densState = DENS_IDLE;
-      isMeasuring = false;
-      handleLights();
-      updateNextionUI(true);
-      beepWarnLong();
-      lcd.clear();
+
+    if (backPressed) densAbort = true;
+
+    // 3. Abort Handler
+    if (densAbort) {
+        densState = DENS_IDLE;
+        densAbort = false;
+        HW_SetEnlargerNeoPixel(0, 0, 0);
+        isMeasuring = false; // FIX A5: Sperre beim Exit sicherheitshalber aufheben
+        uiUpdateLCD("DENS EXIT", "");
+        uiTriggerBeep(SND_BACK);
+        updateNextionUI(true);
+        // Rückkehr zum Hauptmodus erfolgt über die Main-Loop Steuerung
+        return;
     }
-    return;
-  }
 
-  // Navigation
-  if (key == '*') {
-      if (densState == DENS_IDLE) { exitDensMode(); return; }
-      else {
-       densState = DENS_IDLE;
-       isMeasuring = false;
-       handleLights();
-       updateNextionUI(true);
-       beepWarnLong();
-       lcd.clear();
-      }
-  }
+    // 4. Live-Messung für die Anzeige
+    liveLux = getSafeLiveLux();
 
-  // If a short message is showing, don't proceed yet
-  if (millis() < densMsgUntil) return;
+    // 5. State Machine
+    switch (densState) {
+        case DENS_IDLE:
+            isMeasuring = false; // FIX A5: Im Idle keine Sperre
+            // Encoder-Navigation für das Untermenü (Referenz vs. Dunkelstrom)
+            if (encDelta != 0) {
+                idleMenuIdx = (idleMenuIdx == 0) ? 1 : 0;
+                uiTriggerBeep(SND_NAV);
+                updateNextionUI(true);
+            }
 
-  // --- HIER WAR DER FEHLER: PIN_SAFE_LIGHT -> PIN_SW_RED ---
-  bool safeOn = (digitalRead(PIN_RELAY_SAFE) == HIGH);
-  bool lightOn = (digitalRead(PIN_RELAY_ENLARGER) == HIGH);
-  
-  // Lichtsteuerung im Densitometer-Modus
-  // Wir erlauben manuelles Licht zum Positionieren
-  static int lastDensLight = -1;
-  int targetL = 0;
-  if (safeOn) targetL = 1;
-  if (lightOn) targetL = 2;
-  
-  if (targetL != lastDensLight) {
-    if (targetL == 0) PaintLED(0,0,0);
-    else if (targetL == 1) PaintLED(set_safe > 0 ? set_safe : 255, 0, 0); // Rot
-    else PaintLED(set_focus, set_focus, set_focus); // Weiß
-    lastDensLight = targetL;
-  }
+            if (idleMenuIdx == 0) {
+                // Normales Menü
+                uiUpdateLCD("DENSITOMETER", "START=REF ENTER=M");
+                
+                if (startPressed) {
+                    densState = DENS_REF;
+                    uiTriggerBeep(SND_NAV);
+                    updateNextionUI(true);
+                }
+                
+                if (enterPressed) {
+                    // RefLux muss signifikant höher sein als das Rauschen!
+                    if (densRefLux > baseDarkLux + 0.001) {
+                        densState = DENS_MEAS;
+                        uiTriggerBeep(SND_OK);
+                        updateNextionUI(true);
+                    } else {
+                        uiUpdateLCD("NO REF DATA", "Calibrate first!");
+                        uiTriggerBeep(SND_WARN);
+                        densMsgUntil = millis() + 1500;
+                        updateNextionUI(true);
+                    }
+                }
+            } else {
+                // Dark Calibration Menü
+                uiUpdateLCD("DENS: DARK CALIB", "START=CAL DARK");
+                
+                if (startPressed) {
+                    isMeasuring = true; // FIX A5: Sperre aktivieren für Dark Calib
+                    uiUpdateLCD("MEASURING...", "Keep Dark!");
+                    // Absolutes Grounding: Alle Lichter physikalisch aus!
+                    HW_SetFocus(false);
+                    HW_SetSafelight(false);
+                    HW_SetEnlargerNeoPixel(0,0,0);
+                    vTaskDelay(pdMS_TO_TICKS(500)); // Sensor beruhigen lassen
+                    
+                    float sum = 0;
+                    for(int i=0; i<10; i++) {
+                        sum += getSafeLiveLux();
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    baseDarkLux = (double)(sum / 10.0);
+                    
+                    saveSettings(); // Dauerhaft im EEPROM ablegen
+                    
+                    isMeasuring = false; // FIX A5: Sperre aufheben
+                    uiUpdateLCD("DARK LUX SAVED", "System Grounded");
+                    uiTriggerBeep(SND_DONE);
+                    idleMenuIdx = 0;
+                    densMsgUntil = millis() + 1500;
+                    updateNextionUI(true);
+                }
+            }
+            break;
 
-  // State Machine
-  switch (densState) {
-    case DENS_IDLE: {
-       smartLCD("DENSITOMETER", "A=CAL REF  B=MEAS");
-       if (key == 'A') { 
-         densState = DENS_REF; 
-         beepOk(); 
-         lcd.clear(); lcd.print("CALIBRATE REF"); 
-         densMsgUntil = millis() + 600;
-       }
-       if (key == 'B') {
-         if (densRefLux > 0.0001) {
-           densState = DENS_MEAS;
-           beepOk();
-           lcd.clear();
-         } else {
-           beepWarnLong();
-           smartLCD("NO REF DATA", "Please Calib (A)");
-           densMsgUntil = millis() + 1000;
-         }
-       }
-    } break;
+        case DENS_REF: // Referenzmessung (D=0)
+            isMeasuring = true; // FIX A5: Sperre aktivieren für Referenzmessung
+            uiUpdateLCD("CALIBRATE REF", "Place Probe!");
+            HW_SetFocus(true); // Weißlicht an zum Messen
+            
+            if (startPressed) {
+                float sum = 0;
+                for(int i=0; i<5; i++) {
+                    sum += getSafeLiveLux();
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                densRefLux = sum / 5.0;
+                updateNextionUI(true);
+                
+                if (densRefLux > baseDarkLux + 0.01) {
+                    uiUpdateLCD("REF SAVED", "D=0.00 Set");
+                    uiTriggerBeep(SND_DONE);
+                    densState = DENS_IDLE;
+                    densMsgUntil = millis() + 1000;
+                    updateNextionUI(true);
+                } else {
+                    uiUpdateLCD("TOO DARK!", "Check Light");
+                    uiTriggerBeep(SND_WARN);
+                    updateNextionUI(true);
+                }
+                HW_SetFocus(false);
+                isMeasuring = false; // FIX A5: Sperre aufheben
+            }
+            break;
 
-    case DENS_REF: {
-       smartLCD("1. LIGHT ON (W)", "2. PRESS # SET");
-       // Messen und Anzeigen (Live)
-       if (tslBaseOK) {
-          uint32_t lum = tslBase.getFullLuminosity();
-          uint16_t ir = lum >> 16;
-          uint16_t full = lum & 0xFFFF;
-          double lux = tslBase.calculateLux(full, ir);
-          lcd.setCursor(12, 1); lcd.print(String(lux, 1));
-       }
-       
-       if (key == '#') {
-         isMeasuring = true;
-         handleLights();
-         lcd.setRGB(0, 0, 0);
-         updateNextionUI(true);
-         if (startAsyncSpot(10, 50, 150)) {
-           densMeasBusy = true;
-         } else {
-           isMeasuring = false;
-           handleLights();
-           beepWarnLong();
-           smartLCD("BUSY", "TRY AGAIN");
-           densMsgUntil = millis() + 500;
-         }
-       }
-    } break;
+        case DENS_MEAS: // Kontinuierliche Dichte-Messung
+        {
+            isMeasuring = true; // FIX A5: Sperre aktivieren für die kontinuierliche Messung
+            HW_SetFocus(true);
+            
+            char l1[17], l2[17];
+            double D = 0.0;
+            double net = 0.0;
+            bool netValid = false;
+            
+            // ROOT CAUSE FIX: Dunkelstrom-Korrektur (Systematic Error bei D > 2.0)
+            double corrRef = (double)densRefLux - baseDarkLux;
+            double corrLive = (double)liveLux - baseDarkLux;
 
-    case DENS_MEAS: {
-       if (!isMeasuring) {
-         isMeasuring = true;
-         handleLights();
-         updateNextionUI(true);
-       }
-       lcd.setRGB(0, 0, 0);
-       // Kontinuierliche Messung
-       double lux = 0.0;
-       if (tslBaseOK) {
-          uint32_t lum = tslBase.getFullLuminosity();
-          uint16_t ir = lum >> 16;
-          uint16_t full = lum & 0xFFFF;
-          lux = tslBase.calculateLux(full, ir);
-       }
-       
-       String l1 = "L:" + String(lux, 2);
-       String l2 = "";
-       
-       if (densRefLux > 0 && lux > 0) {
-         double D = log10(densRefLux / lux);
-         if (D < 0) D = 0.0;
-         l1 += " D=" + String(D, 2);
-         
-         // Zonen-Logik (Optional)
-         // Wenn BaseFog gesetzt ist, zeigen wir Netto-Dichte
-         if (!isnan(densBaseFog)) {
-            double net = D - densBaseFog;
-            l2 = "Net:" + String(net, 2);
-            // Zone 8 Check (ca 1.20 - 1.30 über Base)
-            if (abs(net - zone8TargetNet) < 0.05) l2 += " *Z8*";
-         } else {
-            l2 = "#=SET BASE FOG";
-         }
-       } else {
-         l1 += " --";
-       }
-       
-       smartLCD(l1, l2);
-       
-       // Base Fog setzen
-       if (key == '#') {
-         if (densRefLux > 0 && lux > 0) {
-            double D = log10(densRefLux / lux);
-            densBaseFog = D;
-            beepOk();
-            smartLCD("BASE FOG SET", String(densBaseFog, 2));
-            densMsgUntil = millis() + 800;
-         }
-       }
-       
-       // Reset Base Fog
-       if (key == 'C') {
-         densBaseFog = NAN;
-         beepValue();
-       }
+            // Schutz vor Division-by-Zero oder Logarithmus von Negativwerten
+            if (corrRef > 0.00001 && corrLive > 0.00001) {
+                D = log10(corrRef / corrLive);
+                if (D < 0.0) D = 0.0;
+                snprintf(l1, 17, "Lx:%0.1f D:%0.2f", liveLux, D);
+            } else {
+                snprintf(l1, 17, "Lx:%0.1f D:---", liveLux);
+            }
 
-    } break;
-  }
+            if (!isnan(densBaseFog)) {
+                net = D - densBaseFog;
+                netValid = true;
+                snprintf(l2, 17, "Net:%0.2f  *Z8*", net);
+            } else {
+                snprintf(l2, 17, "START=SET BASE");
+            }
+
+            uiUpdateLCD(l1, l2);
+            updateNextionUI(true);
+
+            if (startPressed) {
+                densBaseFog = D;
+                uiTriggerBeep(SND_VALUE);
+                updateNextionUI(true);
+            }
+            
+            if (enterPressed) {
+                if (netValid) {
+                    // BW-Dens-Workflow: Messwert uebernehmen -> BW-Belichtung korrigieren.
+                    // deltaDensity > 0: Ziel dichter als Ist -> laenger belichten.
+                    const double deltaDensity = zone8TargetNet - net;
+                    const double evCorrection = deltaDensity * 3.32192809489; // log2(10)
+                    const double factor = pow(2.0, evCorrection);
+
+                    if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                        if (hwSwitchDoseMode) {
+                            dose_bw = fmax(0.1, fmin(999.0, dose_bw * factor));
+                        } else {
+                            time_bw = (float)fmax(TIME_MIN_S, fmin(TIME_MAX_S, (double)time_bw * factor));
+                        }
+                        trackDensityEV = evCorrection;
+                        measurementOverrideActive = true;
+                        xSemaphoreGive(gTimerMutex);
+                    }
+
+                    extern void refreshDisplayVariables();
+                    refreshDisplayVariables();
+                    uiUpdateLCD("DENS APPLIED", "BW UPDATED");
+                    uiTriggerBeep(SND_DONE);
+                }
+                densState = DENS_IDLE;
+                HW_SetFocus(false);
+                isMeasuring = false; // FIX A5: Sperre aufheben
+                updateNextionUI(true);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
 }

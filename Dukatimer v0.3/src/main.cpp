@@ -1,776 +1,532 @@
-/* Main.cpp - DUKATIMER ESP32-S3
-   Version: 0.3.10 (PSRAM-Aktivierung, Performance-Optimierung, CDC-Fix)
-
-   ÄNDERUNGEN gegenüber v0.3.9.1:
-   - PSRAM (OPI) aktiviert: PaperBank liegt jetzt im externen PSRAM
-   - NeoPixel-Buffer bleibt bewusst im internen SRAM (RMT-DMA-Kompatibilität)
-   - USB-CDC Logging wird während Belichtung unterdrückt (Jitter-Vermeidung)
-   - Speicher-Diagnose beim Booten (PSRAM/Heap-Info auf Serial)
-   - I2C Bus 1 auf 400 kHz für schnellere TSL2561-Abfragen
+/* Main.cpp - DUKATIMER ESP32-S3 (v0.5 Root Cause Edition)
+   
+   Version: 0.5.0
+   Fokus: Vollständige Core-Isolation, Latenzfreiheit & v0.3.10 Feature-Parität.
+   
+   Architektur-Verteilung:
+   - CORE 0 (TaskIO): Nextion UART, LCD I2C, Sound-Queue, Housekeeping (Temperatur).
+   - CORE 1 (TaskRealtime): Encoder-Polling, Input-Queue, Belichtungs-Timer, HAL-Lichtsteuerung.
 */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <EEPROM.h>
+#include <nvs_flash.h> 
 #include <esp_task_wdt.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ESP32Encoder.h>
 #include <Adafruit_TSL2591.h>
 #include <Adafruit_TSL2561_U.h>
-#include <Adafruit_NeoPixel.h>
 #include <Adafruit_BMP280.h>
-#include <esp_heap_caps.h>           // PSRAM: heap_caps_malloc()
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include "rgb_lcd.h"
 
 #include "Config.h"
 #include "Types.h"
 #include "Globals.h"
 #include "Logic_Papers.h"
+#include "Logic_Storage.h"
 #include "DisplayManager.h"
 #include "Logic_Measurement.h"
+#include "Logic_Timer.h"
+#include "ExposureEngine.h"
 
 // =============================================================================
-// GLOBAL VARIABLES
+// GLOBAL VARIABLE DEFINITIONS (Single Source of Truth)
 // =============================================================================
+
 SemaphoreHandle_t gTimerMutex = NULL;
 SemaphoreHandle_t gPixelMutex = NULL;
-volatile SystemError lastSystemError = ERR_NONE;
-volatile bool softAbortActive = false;
-volatile unsigned long softAbortUntilMs = 0;
-bool isPaused = false;
-bool isMeasuring = false;
-bool bootScreenActive = true; // Hält den Sensor-Status am Anfang
-bool setupMenuActive = false;
+SemaphoreHandle_t xI2CMutex   = NULL;
+SemaphoreHandle_t xShadowMutex = NULL;
+QueueHandle_t xInputQueue     = NULL;
+QueueHandle_t xSoundQueue     = NULL;
 
-// =============================================================================
-// WIRELESS SENSOR (ESP-NOW Bidirektional)
-// =============================================================================
-bool useWirelessProbe = false;         // Standard: Kabelgebunden
-volatile double remoteLux = 0.0;
-volatile unsigned long lastRemotePacketMs = 0;
-volatile uint8_t probeLastEvent = 0;   // EVT_NONE
-volatile float   probeLuxG0 = 0.0f;
-volatile float   probeLuxG5 = 0.0f;
-volatile bool    probeEventPending = false;
-volatile bool    probeConnected = false;
-bool probeFlashActive = false;
-bool measurementOverrideActive = false;
-
-TwoWire& I2C_SLOW = Wire;
 TwoWire I2C_FAST = TwoWire(1);
-Adafruit_NeoPixel pixels(NEOPIXEL_COUNT, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 Adafruit_TSL2591 tslBase = Adafruit_TSL2591(2591);
-Adafruit_TSL2561_Unified tslLive = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+Adafruit_TSL2561_Unified tslHead = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+Adafruit_TSL2561_Unified& tslLive = tslHead; 
+rgb_lcd lcd;
 OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature sensors(&oneWire);
 Adafruit_BMP280* bmpPtr = nullptr;
-rgb_lcd lcd;
+Adafruit_BME280* bmePtr = nullptr;
 
-// Status Flags
-bool tslBaseOK = false, tslLiveOK = false, lcdOK = false, nextonOK = false;
-bool bmpOK = false, tempSensorOK = false, neoPixelOK = false, overheatLock = false;
-double tempAlu = 0.0;
-double tempRoom = 0.0;
+bool tslBaseOK = false, tslHeadOK = false, tslLiveOK = false;
+bool bmpOK = false, bmeOK = false, lcdOK = false, neoPixelOK = false, tempSensorOK = false;
+bool isBME280 = false;
+volatile bool overheatLock = false;
+double tempAlu = 0.0, tempAmbient = 0.0, tempRoom = 0.0, pressRoom = 0.0, humRoom = 0.0;
 int currentGainIdx = 0;
-bool whiteLatch = false, safeLatch = false, roomLatch = false, screenOffOverride = false;
 
-unsigned long starttime = 0;
-double time_soft = 10.0, time_hard = 0.0, time_bw = 12.0, grade_bw = 2.5;
-
-BurnMode burnMode = BURN_OFF;
+bool hwSwitchDoseMode = false;
+double target_dose = 100.0, current_dose = 0.0, spectral_ratio = 1.0;
+double dose_bw = 12.0, dose_soft = 10.0, dose_hard = 0.0;
+double targetDoseSoft = 0.0, targetDoseHard = 0.0;
+float time_bw = 12.0, grade_bw = 2.5, time_soft = 10.0, time_hard = 0.0;
+float burnEv = 0.0;
 double burnGrade = 2.5;
-double burnEv = 0.0;
 
-uint8_t set_safe = 30, set_focus = 255, set_lcd = 100, set_max = 255;
-StepSize globalStepMode = STEP_THIRD; 
+volatile unsigned long starttime = 0;
 
+volatile Mode currentMode = MODE_BW;
+SplitState splitState = SPLIT_IDLE;
+CalStep calState = CAL_IDLE;
+BurnMode burnMode = BURN_OFF;
+StepSize globalStepMode = STEP_THIRD;
+
+uint8_t pwmValGreen = 0, pwmValBlue = 0;
+float baseFlux = 1.0f;
+int multival[11][3] = { {0,255,0}, {0,235,20}, {0,215,40}, {0,195,60}, {0,170,85}, {0,143,112}, {0,115,140}, {0,85,170}, {0,60,200}, {0,30,225}, {0,0,255} };
+double paperSpeed[11] = { 1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.1, 1.3, 1.6, 2.0 };
+
+volatile bool statusEnlargerOn = false, statusSafeOn = false, isRoomDarknessActive = false;
+volatile bool safeLatch = false, whiteLatch = false, roomLatch = false;
+volatile bool measurementOverrideActive = false, screenOffOverride = false;
+volatile bool isPaused = false, isMeasuring = false;
+volatile bool bootScreenActive = true, setupMenuActive = false;
+
+// FIX A1: Zentrale Licht-Sperrlogik
+volatile bool lightOperationActive = false;
+volatile bool softAbortActive = false;
+volatile unsigned long softAbortUntilMs = 0;
+
+TSState ts = TS_OFF;
+uint8_t tsN = DEFAULT_TS_N;
+double tsEv = DEFAULT_TS_EV;
+double tsA[10] = {0};
+uint8_t tsK = 0;
+TSChannel tsCh = TS_BW;
+double tsSum = 0.0;
+bool tsActiveExposure = false;
+
+DensitometerState densState = DENS_IDLE;
+DensSubMode densSub = DENS_SUB_MANUAL;
+double densRefLux = 0.0, densBaseFog = 0.0, zone8TargetNet = 1.25;
+
+double baseDarkLux = 0.0;
+double probeDarkLux = 0.0;
+
+double paper_iso_p = 0.0, paper_iso_r = 0.0;
+char activePaperName[32] = "Default";
+PaperBank* paperBankPtr = nullptr;
+
+volatile uint32_t totalDroppedPackets = 0, probeEventOverruns = 0;
+volatile bool probeConnected = false, probeEventPending = false;
+volatile uint8_t probeLastEvent = 0;
+volatile float probeLuxG0 = 0.0f, probeLuxG5 = 0.0f;
+volatile double remoteLux = 0.0;
+volatile unsigned long lastRemotePacketMs = 0;
+bool probeFlashActive = false;
+
+volatile SystemError lastSystemError = ERR_NONE;
+
+SettingsObject globalSet;
+uint8_t set_safe = 100, set_focus = 255, set_lcd = 100, set_max = 255;
+bool useWirelessProbe = true; // Wireless als Standard
+uint8_t currentZoneHistogram[11] = {0};
+MeasureFocus currentMeasureFocus = FOCUS_HIGHLIGHTS;
+float timer_base_seconds = 0.0f;
+float calibBaseLuxG0 = 0.0f;
+float calibBaseLuxG5 = 0.0f;
+float calibTimeSeconds = 0.0f;
 double trackDensityEV = 0.0;
 double trackGradeSteps = 0.0;
 String overlayText = "";
 unsigned long infoEndTime = 0;
 int pendingPaperSlot = -1;
-double measSoftSum = 0.0; int measSoftCount = 0;
-double measHardSum = 0.0; int measHardCount = 0;
-double measBWSum = 0.0; int measBWCount = 0;
-MeasureMode measureMode = MM_OFF;
-MeasureFocus currentMeasureFocus = FOCUS_HIGHLIGHTS;
-MeasureState currentMeasureState = MEASURE_IDLE;
-float timer_base_seconds = 0.0;
-uint8_t currentZoneHistogram[11] = {0};
-double targetDoseSoft = 0.0;
-double targetDoseHard = 0.0;
-unsigned long measureUiSinceMs = 0;
+double measSoftSum = 0.0, measHardSum = 0.0, measBWSum = 0.0;
+int measSoftCount = 0, measHardCount = 0, measBWCount = 0;
+// BETA-FIX: Schritt 3 - Signalisierung fuer anstehende Messwert-Uebernahme.
+volatile bool bwAutoPending = false;
 
-TSState ts = TS_OFF;
-TSChannel tsCh = TS_BW;
-uint8_t tsN = DEFAULT_TS_N;
-double tsEv = DEFAULT_TS_EV;
-uint8_t tsK = 0;
-double tsA[10] = {0};
-double tsSum = 0.0;
-bool tsActiveExposure = false;
-
-Mode currentMode = MODE_BW;
-SplitState splitState = SPLIT_IDLE;
-SettingsObject globalSet;
-bool settingsDirty = false;
-unsigned long lastSettingChange = 0;
-
-int multival[11][3] = { {0,255,0}, {0,235,20}, {0,215,40}, {0,195,60}, {0,170,85}, {0,143,112}, {0,115,140}, {0,85,170}, {0,60,200}, {0,30,225}, {0,0,255} };
-
-double paperSpeed[11] = { 1.1, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.1, 1.3, 1.6, 2.0 };
-bool sgShiftModeDensity = false;
-
-DensitometerState densState = DENS_IDLE;
-DensSubMode densSub = DENS_SUB_MANUAL;
-double densRefLux = 0.0;
-double densBaseFog = NAN;
-double zone8TargetNet = 1.20;
+// Protokoll-Grounding: Beide Firmwares muessen dieselben Strukturgroessen sehen.
+// Damit verhindern wir schleichende ABI-Fehler durch Padding/Compiler-Unterschiede,
+// die sonst genau zu "Anzeige geht, Eingaben gehen nicht" fuehren koennen.
+static_assert(sizeof(ProbeEventPacket) == 16, "ProbeEventPacket ABI mismatch: erwartet 16 Byte");
+static_assert(sizeof(ProbeRenderPacket) == 63, "ProbeRenderPacket ABI mismatch: erwartet 63 Byte");
+static_assert(sizeof(WirelessPacket) == 12, "WirelessPacket ABI mismatch: erwartet 12 Byte");
 
 // =============================================================================
-// SYSTEM FUNCTIONS
+// TASK IO (Core 0): Latenz-Management
+// =============================================================================
+void vTaskIO(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+
+    for (;;) {
+        esp_task_wdt_reset();
+
+        // Im Bridge-Modus darf Core 0 keinerlei Bytes aus Serial2 lesen, weil sonst der
+        // Upload-Datenstrom zwischen PC und Nextion zerstueckelt wuerde. Deshalb wird die
+        // regulare Nextion-Ereignisverarbeitung fuer diesen Spezialmodus hart uebersprungen.
+        if (currentMode != MODE_BRIDGE) {
+            DM_loop();
+        }
+
+        if (bootScreenActive) {
+            extern void runBootDiagnostics();
+            runBootDiagnostics();
+
+            // ROOT CAUSE FIX:
+            // Der Boot-Diagnosepfad schreibt seine Texte nur in den LCD-Shadow-Buffer.
+            // Vorher wurde bei aktivem bootScreenActive mit `continue` direkt aus dem
+            // Task gesprungen, bevor processLCDShadow() den Puffer auf das echte I2C-LCD
+            // ausgeben konnte. Ergebnis: Das 16x2-LCD blieb scheinbar "eingefroren"
+            // auf der letzten Seite, die in setup() direkt per lcd.print() geschrieben
+            // wurde. Wir flushen deshalb den Shadow-Buffer explizit auch im Bootmodus.
+            extern void processLCDShadow();
+            processLCDShadow();
+
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        
+        extern void processLCDShadow();
+        processLCDShadow();
+        
+        extern void processSoundQueue();
+        processSoundQueue();
+        
+        static unsigned long lastHousekeeping = 0;
+        if (millis() - lastHousekeeping > 2000) {
+            if (tempSensorOK) {
+                sensors.requestTemperatures();
+                float t = sensors.getTempCByIndex(0);
+                if (t > -100 && t < 150) tempAlu = t;
+            }
+            // FIX A2: BMP read must be wrapped in xI2CMutex
+            if (bmpOK && bmpPtr) {
+                if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    tempRoom = bmpPtr->readTemperature();
+                    xSemaphoreGive(xI2CMutex);
+                }
+                tempAmbient = tempRoom;
+            }
+            
+            extern void processDeferredEEPROM();
+            processDeferredEEPROM();
+
+            // FIX Punkt 2: Periodische Queue-Overflow-Diagnose
+            {
+                extern volatile uint32_t inputQueueDrops;
+                if (probeEventOverruns > 0 || inputQueueDrops > 0) {
+                    Serial.printf("[DIAG] probeEvtOverruns=%lu  inputQDrops=%lu\n",
+                                  (unsigned long)probeEventOverruns, (unsigned long)inputQueueDrops);
+                }
+            }
+
+            lastHousekeeping = millis();
+        }
+        
+        static unsigned long lastUIRefresh = 0;
+        if (millis() - lastUIRefresh > 100) {
+            // Dieselbe Schutzregel gilt fuer UI-Schreibzugriffe: Waehrend der Bridge darf Core 0
+            // keine Display-Kommandos erzeugen. Sonst wuerde der Upload-Stream mit UI-Daten
+            // vermischt, auch wenn zusaetzlich der Serial-Mutex gehalten wird.
+            if (currentMode != MODE_BRIDGE) {
+                extern void updateNextionUI(bool force); // NEXTION UI INTEGRATION
+                updateNextionUI(false);
+            }
+            lastUIRefresh = millis();
+        }
+        
+        static unsigned long lastProbeCheck = 0;
+        if (millis() - lastProbeCheck > 250) {
+            // Risikoarmer Stabilitaets-Fix:
+            // Beim Start der Spektralmessung kann das Handgeraet mehrere Sekunden mit
+            // Sensorintegration/Retry beschaeftigt sein. In dieser Phase entstehen sonst
+            // false negatives auf der Verbindungsanzeige.
+            // Es wird nur die Timeout-Grenze angehoben, keine Ablauf-Logik geaendert.
+            if (probeConnected && (millis() - lastRemotePacketMs > 12000)) probeConnected = false;
+
+            // Kommunikations-Race-Fix:
+            // Waehrend des spektralen Flash-Handshakes sendet der S3 gezielte
+            // CMD_MEASURE_G0/G5-Pakete. Zyklische Hintergrund-Renderpakete aus dieser
+            // 250ms-Schleife koennen den C6-Command-Puffer zeitlich ueberlagern und damit
+            // den Messauftrag verdraengen. Ergebnis war ein sichtbares "halb verbunden":
+            // Display-Updates kamen an, aber Messstart ueber T2 schlug sporadisch/haeufig fehl.
+            //
+            // Deshalb unterdruecken wir die periodischen Render-Sends, solange ein aktiver
+            // Mess-Handshake laeuft. Nach Abschluss laeuft das normale Rendering automatisch
+            // weiter.
+            extern bool isMeasurementActive();
+            const bool handshakeAktiv = isMeasurementActive();
+            if (!handshakeAktiv) {
+                extern void updateProbeDisplay();
+                updateProbeDisplay();
+            }
+            lastProbeCheck = millis();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// =============================================================================
+// TASK REALTIME (Core 1): Zeitkritische Logik
+// =============================================================================
+void vTaskRealtime(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+
+    for (;;) {
+        esp_task_wdt_reset();
+
+        extern void HW_Input_Process();
+        HW_Input_Process();
+        
+        handleInput();
+        handleTimer();
+        ExposureEngine_Tick();   // Zentrale Engine-Tick für ALLE Belichtungs-Modi
+        handleLights();
+        handleLCDBacklight();
+        
+        // =====================================================================
+        // PFLICHTENHEFT FIX (Modus 9 / 10): Vollständiges Probe-Event-Routing
+        // VORHER: Alle C6-Events gingen ausschließlich an handleMeasurementStateMachine().
+        //         Events wie T2_CLICK (Messen/Feuer), T1_CLICK (Undo/Referenz),
+        //         ENC_UP/DOWN (Navigation) und ENC_CLICK (Abschließen) wurden
+        //         in allen Modi außer der Spektralmessung verworfen.
+        // NEU: Modusspezifisches Routing gemäß Pflichtenheft Abschnitt 9.2:
+        //   A) Mess-Modus: T2=Spektralmessung, T1=Undo, ENC=Kanal/Abschluss
+        //   B) Burn-Modus: T2=Fernauslöser, T1=Abbruch, ENC=Burn-Step-Navigation
+        //   C) Kalibrierung: T2=Messung triggern
+        //   D) Densitometer: T1=Referenz, T2=Messung
+        // Die Spectral-Statemachine (Flash-Handshake) behält Priorität für
+        // EVT_LUX_DATA Pakete, die direkt aus dem Handshake kommen.
+        // =====================================================================
+        uint8_t pEvt = EVT_NONE;
+        float pG0 = 0.0f, pG5 = 0.0f;
+        extern bool popProbeEvent(uint8_t&, float&, float&);
+        extern bool handleMeasurementStateMachine(uint8_t, float, float);
+        if (popProbeEvent(pEvt, pG0, pG5)) {
+            // Priorität 1: Laufende Spektralmessung (Flash-Handshake) hat Vorrang
+            bool consumed = handleMeasurementStateMachine(pEvt, pG0, pG5);
+            
+            // Priorität 2: Modusspezifisches Event-Routing (Pflichtenheft 9.2)
+            if (!consumed) {
+                extern void handleProbeEventForCurrentMode(uint8_t evt, float luxG0, float luxG5);
+                handleProbeEventForCurrentMode(pEvt, pG0, pG5);
+            }
+        } else {
+            // FIX K1: State Machine zyklisch ticken auch ohne eingehende Events.
+            // Warmup-Timer (150ms) und Timeouts (2500ms) feuern sonst nie.
+            handleMeasurementStateMachine(EVT_NONE, 0.0f, 0.0f);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// =============================================================================
+// SYSTEM HELPER (v0.3.10 Legacy Parity)
 // =============================================================================
 
-// ---------------------------------------------------------------------------
-// PSRAM-Initialisierung: Allokiert große Datenstrukturen im externen Speicher
-// ---------------------------------------------------------------------------
-// Warum PSRAM?
-//   Der ESP32-S3-N16R8 hat nur ~512 KB internen SRAM, davon ~320 KB nutzbar.
-//   WiFi/ESP-NOW belegen ~40 KB, FreeRTOS-Stacks ~16 KB, I2C-Buffer etc.
-//   Durch Auslagerung der PaperBank (~2.4 KB) in den PSRAM bleibt mehr
-//   interner Speicher für zeitkritische Interrupts und DMA-Buffer.
-//
-// Warum NeoPixel NICHT im PSRAM?
-//   Der NeoPixel-Buffer ist nur 768 Bytes (256 LEDs × 3 Bytes). Der RMT-
-//   Peripherie-Treiber liest den Buffer per CPU-Zugriff und wandelt ihn
-//   in RMT-Items um. Obwohl PSRAM funktionieren würde, überwiegt der Vorteil
-//   des schnelleren, deterministischen Zugriffs aus dem internen SRAM.
-// ---------------------------------------------------------------------------
+static void panicPSRAMFail() {
+    Serial.println("[PSRAM] KRITISCH: PaperBank-Allokation fehlgeschlagen. Systemstopp.");
+
+    lcd.setCursor(0, 0);
+    lcd.print(" !!! KRITISCH !!!");
+    lcd.setCursor(0, 1);
+    lcd.print("  PSRAM FAIL   ");
+    lcd.setRGB(255, 0, 0);
+
+    uiTriggerBeep(SND_ALARM);
+
+    extern void processSoundQueue();
+    for (;;) {
+        processSoundQueue();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 void initPSRAMStructures() {
-    // 1. PaperBank im PSRAM allokieren (Fallback: interner Heap)
-    if (psramFound()) {
+    bool hasPsram = psramFound();
+    Serial.printf("[PSRAM] psramFound()=%s  getPsramSize=%d KB\n",
+        hasPsram ? "true" : "false", (int)(ESP.getPsramSize() / 1024));
+
+    if (hasPsram) {
         paperBankPtr = (PaperBank*)heap_caps_malloc(sizeof(PaperBank), MALLOC_CAP_SPIRAM);
         if (paperBankPtr) {
-            Serial.printf("[PSRAM] PaperBank allokiert: %d Bytes in PSRAM\n", sizeof(PaperBank));
+            memset(paperBankPtr, 0, sizeof(PaperBank));
+            Serial.printf("[PSRAM] PaperBank im PSRAM allokiert: %d Bytes\n", (int)sizeof(PaperBank));
+            return;
         }
+        Serial.println("[PSRAM] WARN: heap_caps_malloc fehlgeschlagen, Fallback auf int. RAM.");
+    } else {
+        Serial.println("[PSRAM] WARN: Kein PSRAM erkannt. Pruefe board/memory_type in platformio.ini.");
+        Serial.println("[PSRAM]   board=esp32s3  +  board_build.arduino.memory_type=qio_opi  (fuer N16R8)");
+        Serial.println("[PSRAM]   Alternativer memory_type: qio_qspi (QSPI-PSRAM), opi_opi (OPI-Flash)");
     }
-    // Fallback: Wenn PSRAM fehlt oder Allokation fehlschlägt → interner Heap
-    if (!paperBankPtr) {
-        paperBankPtr = (PaperBank*)malloc(sizeof(PaperBank));
-        Serial.println("[PSRAM] WARNUNG: PaperBank im internen SRAM (PSRAM nicht verfügbar)");
-    }
-    // Sicherheits-Nullung (verhindert Müll-Daten vor EEPROM-Load)
+
+    // Fallback: Internes RAM. Kein harter Halt – erst Diagnose, dann entscheiden.
+    paperBankPtr = (PaperBank*)malloc(sizeof(PaperBank));
     if (paperBankPtr) {
         memset(paperBankPtr, 0, sizeof(PaperBank));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Speicher-Diagnose: Zeigt verfügbaren Heap und PSRAM beim Booten
-// ---------------------------------------------------------------------------
-// Nützlich zur Überwachung der Speicherauslastung. Wird einmalig nach
-// setup() aufgerufen, damit der Verbrauch aller Init-Routinen sichtbar ist.
-// ---------------------------------------------------------------------------
-void logMemoryInfo() {
-    Serial.println("=== SPEICHER-DIAGNOSE ===");
-    Serial.printf("  Interner Heap frei:  %d Bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    Serial.printf("  Interner Heap max:   %d Bytes (größter Block)\n", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    if (psramFound()) {
-        Serial.printf("  PSRAM frei:          %d Bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        Serial.printf("  PSRAM gesamt:        %d Bytes\n", ESP.getPsramSize());
+        Serial.printf("[RAM] PaperBank im internen RAM: %d Bytes\n", (int)sizeof(PaperBank));
     } else {
-        Serial.println("  PSRAM: NICHT ERKANNT!");
+        // Wirklich kein Speicher mehr – jetzt erst Hardstop
+        panicPSRAMFail();
     }
-    Serial.println("=========================");
 }
 
-void wdt_reset() {
-  esp_task_wdt_reset();
-  yield();
+void logMemoryInfo() {
+    Serial.println("\n=== SYSTEM DIAGNOSTIC =================================");
+    Serial.printf(" Chip:             ESP32-S3 rev%d\n", ESP.getChipRevision());
+    Serial.printf(" CPU Freq:         %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf(" Flash Size:       %d KB\n", ESP.getFlashChipSize() / 1024);
+
+    // PSRAM-Diagnose: Alle drei unabhängigen Erkennungspfade
+    bool psramDetected = psramFound();
+    size_t psramTotal   = ESP.getPsramSize();
+    size_t psramFree    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    Serial.printf(" psramFound():     %s\n", psramDetected ? "JA" : "NEIN");
+    Serial.printf(" ESP.getPsramSize: %d KB\n", psramTotal / 1024);
+    Serial.printf(" SPIRAM Free:      %d KB\n", psramFree / 1024);
+
+    // Allokationstest: Direkt 1KB im PSRAM anfordern (ganz ohne PSRAM --> NULL)
+    void* testPtr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    bool allocOk = (testPtr != nullptr);
+    Serial.printf(" PSRAM Alloc-Test: %s\n", allocOk ? "OK (1KB allokiert)" : "FEHLGESCHLAGEN");
+    if (testPtr) heap_caps_free(testPtr);
+
+    Serial.printf(" Internal Free:    %d KB\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    Serial.printf(" sizeof(PaperBank):%d Bytes\n", (int)sizeof(PaperBank));
+    Serial.printf(" paperBankPtr:     %s (0x%08X)\n",
+        paperBankPtr ? "OK" : "NULL", (unsigned int)(uintptr_t)paperBankPtr);
+    Serial.println("=======================================================\n");
+
+    // Boot-Diagnose direkt auf dem LCD ausgeben (ohne Serial-Monitor nutzbar)
+    char l1[17] = {0};
+    char l2[17] = {0};
+
+    snprintf(l1, sizeof(l1), "PSRAM:%s %4dK", psramDetected ? "JA" : "NEIN", (int)(psramTotal / 1024));
+    snprintf(l2, sizeof(l2), "FREE:%6dK", (int)(psramFree / 1024));
+    lcd.setCursor(0, 0); lcd.print("                ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+    lcd.setCursor(0, 0); lcd.print(l1);
+    lcd.setCursor(0, 1); lcd.print(l2);
+    delay(1300);
+
+    snprintf(l1, sizeof(l1), "ALLOC:%s", allocOk ? "OK" : "FAIL");
+    snprintf(l2, sizeof(l2), "BANK:%6dB", (int)sizeof(PaperBank));
+    lcd.setCursor(0, 0); lcd.print("                ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+    lcd.setCursor(0, 0); lcd.print(l1);
+    lcd.setCursor(0, 1); lcd.print(l2);
+    delay(1300);
+
+    snprintf(l1, sizeof(l1), "INT RAM:%5dK", (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    snprintf(l2, sizeof(l2), "BOOT -> UI");
+    lcd.setCursor(0, 0); lcd.print("                ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+    lcd.setCursor(0, 0); lcd.print(l1);
+    lcd.setCursor(0, 1); lcd.print(l2);
+    delay(1000);
 }
 
-void logError(SystemError err, String context) {
-  if (lastSystemError == err) return;
-  lastSystemError = err;
-  saveErrorState(err);
-  Serial.printf("[! ERROR %d] in %s\n", (int)err, context.c_str());
-}
+void wdt_reset() { esp_task_wdt_reset(); yield(); }
 
 // =============================================================================
-// SETUP
+// SETUP (Bootstrapping v0.5)
 // =============================================================================
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    Serial.setTxTimeoutMs(0); 
 
-  // -----------------------------------------------------------------------
-  // USB-CDC Optimierung: Timeout auf 0 ms setzen
-  // -----------------------------------------------------------------------
-  // Problem: Serial.print() über USB-CDC kann bis zu 100ms blockieren, wenn
-  // der Host (PC) nicht schnell genug liest oder kein USB verbunden ist.
-  // Das würde den Main-Loop und damit die Belichtungssteuerung stören.
-  // Lösung: Mit Timeout 0 wird Serial.print() non-blocking — Daten die
-  // nicht sofort gesendet werden können, werden verworfen statt zu warten.
-  // -----------------------------------------------------------------------
-  Serial.setTxTimeoutMs(0);
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("NVS Partition korrupt/leer. Formatiere...");
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
 
-  esp_task_wdt_init(10, true);
-  esp_task_wdt_add(NULL);
+    esp_task_wdt_init(10, true);
+    esp_task_wdt_add(NULL);
 
-  // -----------------------------------------------------------------------
-  // PSRAM-Strukturen ZUERST initialisieren (vor loadSettings/initPapers!)
-  // -----------------------------------------------------------------------
-  // initPSRAMStructures() allokiert paperBankPtr im PSRAM. Wenn das nicht
-  // vor loadPapers() passiert, würde der NULL-Pointer crashen.
-  // -----------------------------------------------------------------------
-  initPSRAMStructures();
+    gTimerMutex = xSemaphoreCreateMutex();
+    gPixelMutex = xSemaphoreCreateMutex();
+    xI2CMutex   = xSemaphoreCreateMutex();
+    xShadowMutex = xSemaphoreCreateMutex();
+    xInputQueue = xQueueCreate(32, sizeof(InputEvent));
+    xSoundQueue = xQueueCreate(10, sizeof(SoundID));
 
-  gTimerMutex = xSemaphoreCreateMutex();
-  gPixelMutex = xSemaphoreCreateMutex();
-  initClosedLoopTask();
+    Wire.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C0_FREQ);
+    I2C_FAST.begin(PIN_I2C1_SDA, PIN_I2C1_SCL, I2C1_FREQ);
 
-  // --- INPUT PINS ---
-  pinMode(PIN_START, INPUT_PULLUP);
-  pinMode(PIN_SW_ROOMLIGHT, INPUT_PULLUP);
-  pinMode(PIN_SW_FOCUS, INPUT_PULLUP);
-  pinMode(PIN_SW_SAFE, INPUT_PULLUP);
-  pinMode(PIN_SW_ENTER, INPUT_PULLUP); 
-  pinMode(PIN_SW_BACK, INPUT_PULLUP);
+    pinMode(PIN_RELAY_ROOMLIGHT, OUTPUT);
+    digitalWrite(PIN_RELAY_ROOMLIGHT, LOW); 
 
-  // --- KORREKTUR 1: OUTPUT PINS FÜR RELAIS HINZUFÜGEN ---
-  pinMode(PIN_RELAY_ROOMLIGHT, OUTPUT);
-  pinMode(PIN_RELAY_SAFE, OUTPUT);
-  pinMode(PIN_RELAY_ENLARGER, OUTPUT);
-  
-  // Startzustand der Relais definieren
-  digitalWrite(PIN_RELAY_ROOMLIGHT, LOW); 
-  digitalWrite(PIN_RELAY_SAFE, LOW);
-  digitalWrite(PIN_RELAY_ENLARGER, LOW);
-  // -----------------------------------------------------
+    initInput();
+    initWireless();
+    
+    HW_InitLights();
+    neoPixelOK = true;
 
-  I2C_SLOW.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C0_FREQ);
-  I2C_FAST.begin(PIN_I2C1_SDA, PIN_I2C1_SCL, I2C1_FREQ);
-  
-  // LCD INIT
-  lcdOK = false;
-  I2C_SLOW.beginTransmission(LCD_I2C_ADDR); 
-  if (I2C_SLOW.endTransmission() == 0) {
+    // ROOT CAUSE FIX: Hardware Bootscreen für I2C Display!
+    // Gibt sofort physisches Feedback nach dem Strom-Einschalten.
     lcd.begin(16, 2);
-    lcdOK = true;
-    lcd.setRGB(255, 255, 255);
-    lcd.print("Booting...");
-  }
-
-  // Sensoren
-  delay(500);
-  if (tslBase.begin()) tslBaseOK = true;
-
-  if (tslLive.begin(&I2C_FAST)) {
-    tslLiveOK = true;
-    tslLive.enableAutoRange(false);
-    tslLive.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS);
-    tslLive.setGain(TSL2561_GAIN_1X);
-  } else {
-    Serial.println("ERR: TSL2561 not found on Bus 1");
-  }
-  
-  // BMP280 Initialisierung
-  delay(500);
-  bmpPtr = new Adafruit_BMP280(&I2C_SLOW);
-  
-  // VERSUCH 1: Standard 0x76
-  if (!bmpPtr->begin(0x76)) {
-      Serial.println("BMP280 @ 0x76 fail, trying ID override...");
-      // VERSUCH 2: 0x76 mit erzwungener Chip-ID (0x58 ist Standard, 0x60 für BME)
-      if (bmpPtr->begin(0x76, 0x58)) { 
-          bmpOK = true; 
-      } else if (bmpPtr->begin(0x76, 0x60)) { // Falls es ein BME280 ist
-          bmpOK = true;
-      } else {
-          Serial.println("BMP280 FINAL FAIL");
-      }
-  } else {
-      bmpOK = true;
-  }
-
-  // Set BMP280 to forced mode
-  if (bmpOK) {
-      bmpPtr->setSampling(Adafruit_BMP280::MODE_FORCED,
-                          Adafruit_BMP280::SAMPLING_X1, // Temperature oversampling
-                          Adafruit_BMP280::SAMPLING_X1, // Pressure oversampling
-                          Adafruit_BMP280::FILTER_OFF, // No filtering
-                          Adafruit_BMP280::STANDBY_MS_1); // Standby time
-  }
-
-  // DS18B20
-  delay(500);
-  sensors.begin();
-  sensors.setWaitForConversion(false);
-  if (sensors.getDeviceCount() > 0) tempSensorOK = true;
-
-  initInput();
-  initWireless();  // ESP-NOW Empfänger starten
-  pixels.begin();
-  neoPixelOK = true; // <--- DIESE ZEILE FEHLTE! Ohne sie blockt HW_Lights alle Befehle.
-  pixels.clear();    // Einmalig löschen
-  pixels.show();
-  
-delay(500);
-  initDisplays();
-  
-  EEPROM.begin(4096);
-  loadSettings();
-  initPapers();  // Initialize paper bank after settings
-  
-  if (nextonOK) updateNextionUI(true);
-
-  // Neuer Boot-Status Bildschirm
-  if (lcdOK) {
-    lcd.clear();
+    lcd.setRGB(0, 0, 0); // Background aus
     lcd.setCursor(0, 0);
-    lcd.print("SENSOR STATUS:");
+    lcd.print(" DUKATIMER v0.5 ");
     lcd.setCursor(0, 1);
-    String status = "";
-    status += (tslBaseOK ? "L1 " : "l1- ");
-    status += (tslLiveOK ? "L2 " : "l2- ");
-    status += (bmpOK ? "BR " : "br- ");
-    status += (tempSensorOK ? "T " : "t- ");
-    status += (nextonOK ? "N " : "n- ");
-    // PSRAM-Status auf dem LCD anzeigen (P = OK, p- = fehlt)
-    status += (psramFound() ? "P" : "p-");
-    lcd.print(status);
-  }
+    lcd.print(" System Boot... ");
+    lcd.setRGB(0, 100, 255); // Angenehmes Blau
+    
+    // ROOT CAUSE FIX: Boot Race Condition (Nextion)
+    // Wir warten exakt 1 Sekunde, damit man das LCD lesen kann UND 
+    // das Nextion-Display im Hintergrund vollständig hochfahren kann!
+    delay(1000); 
 
-  // Speicher-Diagnose nach vollständiger Initialisierung ausgeben
-  logMemoryInfo();
-}
+    initPSRAMStructures();
 
-// =============================================================================
-// FLASH-HANDSHAKE STATE MACHINE & PROBE DISPLAY
-// =============================================================================
-// Architektur: Asynchrone, deterministische Kommunikation S3 (Licht) <-> C6 (Auge).
-// Phase 1: S3 schaltet NeoPixel G0 (Gruen), sendet CMD_MEASURE_G0 an C6
-// Phase 2: C6 misst, sendet EVT_LUX_DATA -> S3 schaltet G5 (Blau), CMD_MEASURE_G5
-// Phase 3: C6 misst, sendet EVT_LUX_DATA -> S3 verarbeitet Dual-Messwert
-// Timeout: 3s -> automatischer Abort. Blockiert NICHT den Main Loop.
-//
-// Input Merging: Lokale Hardware (Taster, Encoder) und Remote-Events (ESP-NOW)
-// werden ZUERST in logische Action-Flags zusammengefuehrt, BEVOR die Modi-Logik
-// sie verarbeitet. Die Modi wissen nicht, woher der Klick kam.
-// =============================================================================
+    // Jetzt erst wird die serielle Verbindung zum Nextion gestartet.
+    DM_init();
 
-extern portMUX_TYPE luxMux;  // Definiert in HW_Wireless.cpp
-
-// Tick: Wird jeden Loop-Durchlauf aufgerufen.
-// Konsumiert EVT_LUX_DATA Events. Gibt true zurueck wenn Event verarbeitet wurde.
-bool tickFlashHandshake(uint8_t evt, float luxG0, float luxG5) {
-    return handleMeasurementStateMachine(evt, luxG0, luxG5);
-}
-
-void startFlashHandshake() {
-    triggerSpectralMeasurement();
-}
-
-void updateProbeDisplay() {
-    if (!probeConnected || currentMeasureState != MEASURE_IDLE) return;
-
-    char header[16] = {0};
-    char line1[16]  = {0};
-    char line2[16]  = {0};
-    uint8_t mode    = PMODE_IDLE;
-
-    if (starttime != 0) {
-        unsigned long elapsed = millis() - starttime;
-        snprintf(header, sizeof(header), "[ EXPOSURE ]");
-        snprintf(line1,  sizeof(line1),  "T: %.1fs", elapsed / 1000.0);
-        if (burnMode != BURN_OFF)
-            snprintf(line2, sizeof(line2), "BURN +%.1fEV", burnEv);
-        else
-            snprintf(line2, sizeof(line2), "%s", currentMode == MODE_BW ? "BW" : "SG");
-        mode = PMODE_BURN;
-    }
-    else if (isMeteringActive()) {
-        if (currentMode == MODE_BW) {
-            snprintf(header, sizeof(header), "[ BW METER ]");
-            snprintf(line1,  sizeof(line1),  "Spots: %d", measBWCount);
-            if (measBWCount > 0)
-                snprintf(line2, sizeof(line2), "avg:%.1f T2=ADD", measBWSum / (double)measBWCount);
-            else
-                snprintf(line2, sizeof(line2), "T2=ADD ENC=OK");
-            mode = PMODE_METER_BW;
-        } else {
-            bool isSoft = (measureMode == MM_APPLY_SG_G0);
-            int cnt = isSoft ? measSoftCount : measHardCount;
-            snprintf(header, sizeof(header), "[ SG %s ]", isSoft ? "SOFT" : "HARD");
-            snprintf(line1,  sizeof(line1),  "Spots: %d", cnt);
-            snprintf(line2,  sizeof(line2),  "T2=ADD T1=TOG");
-            mode = PMODE_METER_SG;
-        }
-    }
-    else if (burnMode != BURN_OFF) {
-        snprintf(header, sizeof(header), "[ BURN ]");
-        snprintf(line1,  sizeof(line1),  "EV: +%.1f", burnEv);
-        double bt = getEffectiveBurnTime();
-        snprintf(line2,  sizeof(line2),  "T:%.1fs T2=GO", bt);
-        mode = PMODE_BURN;
-    }
-    else {
-        if (currentMode == MODE_BW) {
-            snprintf(header, sizeof(header), "[ BW ]");
-            snprintf(line1,  sizeof(line1),  "T:%.1fs G:%.1f", time_bw, grade_bw);
-        } else {
-            snprintf(header, sizeof(header), "[ SPLITGRADE ]");
-            snprintf(line1,  sizeof(line1),  "S:%.1f H:%.1f", time_soft, time_hard);
-        }
-        snprintf(line2, sizeof(line2), "T2=METER");
-        mode = PMODE_IDLE;
+    if (tslBase.begin()) tslBaseOK = true;
+    if (tslLive.begin(&I2C_FAST)) {
+        tslLiveOK = tslHeadOK = true;
+        tslLive.enableAutoRange(false);
+        tslLive.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS);
+        tslLive.setGain(TSL2561_GAIN_1X);
     }
 
-    sendProbeRender(header, line1, line2, nullptr, HAPTIC_NONE, mode);
-}
+    bmpPtr = new Adafruit_BMP280(&Wire);
+    if (bmpPtr->begin(0x76, 0x58) || bmpPtr->begin(0x76, 0x60)) {
+        bmpOK = true;
+        bmpPtr->setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X1, Adafruit_BMP280::SAMPLING_X1, Adafruit_BMP280::FILTER_OFF, Adafruit_BMP280::STANDBY_MS_1);
+    }
 
-// =============================================================================
-// LOOP
-// =============================================================================
+    sensors.begin();
+    sensors.setWaitForConversion(false);
+    if (sensors.getDeviceCount() > 0) tempSensorOK = true;
+
+    initStorage();
+    loadSettings();
+    initPapers();
+    loadActivePaperProfile();
+
+    extern void initializeDoseStateFromCurrentTimes();
+    initializeDoseStateFromCurrentTimes();
+
+    triggerInfo(); // Füllt den LCD Puffer mit dem finalen Startbildschirm
+    extern void updateNextionUI(bool force);
+    updateNextionUI(true); // Füllt das hochgefahrene Nextion mit den ersten Daten
+
+    xTaskCreatePinnedToCore(vTaskIO, "TaskIO", 8192, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskRealtime, "TaskRealtime", 8192, NULL, 5, NULL, 1);
+
+    initClosedLoopTask();
+
+    logMemoryInfo();
+    uiTriggerBeep(SND_OK);
+}
 
 void loop() {
-    extern void runCalibrationWizard();
-
-    // Kalibrierungs-Wizard zyklisch aufrufen, wenn aktiv
-    extern CalStep calState;
-    if (calState != 0) { // CAL_IDLE = 0
-      runCalibrationWizard();
-      delay(5);
-      return;
-    }
-  wdt_reset();
-  
-  // Hardware-Interaktion prüfen für Boot-Screen Abruch
-  long curSoft = encSoft.getCount();
-  long curHard = encHard.getCount();
-  long curGrade = encGrade.getCount();
-  bool anyButton = (digitalRead(PIN_START) == LOW || 
-                    digitalRead(PIN_SW_ENTER) == LOW || 
-                    digitalRead(PIN_SW_BACK) == LOW);
-
-  if (bootScreenActive) {
-    static long startSoft = curSoft;
-    static long startHard = curHard;
-    static long startGrade = curGrade;
-
-    if (curSoft != startSoft || curHard != startHard || curGrade != startGrade || anyButton) {
-      bootScreenActive = false;
-      triggerInfo();
-      beepOk();
-    } else {
-      handleLights();
-      DM_loop();
-      delay(10);
-      return; 
-    }
-  }
-
-  handleTimer();
-  handleLights();
-  DM_loop();
-
-  // =====================================================================
-  // 1. ATOMICALLY READ PROBE EVENT
-  // =====================================================================
-  uint8_t probeEvt = EVT_NONE;
-  float   pLuxG0 = 0.0f, pLuxG5 = 0.0f;
-    popProbeEvent(probeEvt, pLuxG0, pLuxG5);
-
-    // Fokus-Umschaltung (Lichter <-> Schatten) per Remote-Encoder.
-    // Sofortiges Render-Feedback ans C6 OLED.
-    if (isMeteringActive() && (probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN)) {
-        currentMeasureFocus = (currentMeasureFocus == FOCUS_HIGHLIGHTS)
-            ? FOCUS_SHADOWS : FOCUS_HIGHLIGHTS;
-        sendRenderPacketToC6();
-        probeEvt = EVT_NONE;
-    }
-
-  // =====================================================================
-  // 2. TICK FLASH-HANDSHAKE (konsumiert EVT_LUX_DATA)
-  // =====================================================================
-  if (tickFlashHandshake(probeEvt, pLuxG0, pLuxG5)) {
-      probeEvt = EVT_NONE; // Consumed
-  }
-  if (probeEvt == EVT_HEARTBEAT) probeEvt = EVT_NONE;
-
-  // =====================================================================
-  // 3. COLLECT LOCAL INPUTS
-  // =====================================================================
-  unsigned long now = millis();
-
-  // Grade-Encoder Button (Short/Long Press)
-  static bool gradePressed = false;
-  static bool gradeLongHandled = false;
-  static unsigned long gradePressStart = 0;
-  bool gradeRaw = (digitalRead(PIN_SW_GRADE) == LOW);
-  bool gradeShort = false;
-  bool gradeLong = false;
-
-  if (gradeRaw && !gradePressed) {
-    gradePressed = true;
-    gradeLongHandled = false;
-    gradePressStart = now;
-  }
-  if (!gradeRaw && gradePressed) {
-    if (!gradeLongHandled) gradeShort = true;
-    gradePressed = false;
-  }
-  if (gradePressed && !gradeLongHandled && (now - gradePressStart >= 800)) {
-    gradeLong = true;
-    gradeLongHandled = true;
-  }
-
-  bool evEnter = checkButtonPress(sEnter, PIN_SW_ENTER);
-  bool evBack  = checkButtonPress(sBack,  PIN_SW_BACK);
-  bool evStart = checkButtonPress(btnStart, PIN_START);
-
-  // Encoder Deltas (lokale Drehgeber)
-  static long oldPosSoft = curSoft, oldPosHard = curHard, oldPosGrade = curGrade;
-  long dSoft  = curSoft  - oldPosSoft;
-  long dHard  = curHard  - oldPosHard;
-  long dGrade = curGrade - oldPosGrade;
-
-  // =====================================================================
-  // 4. SUPPRESS INPUT DURING ASYNC MEASUREMENT
-  // =====================================================================
-  // Waehrend Flash-Handshake (C6-Sensor) oder Async-Spot (lokaler Sensor)
-  // laeuft: Nur die Messung ticken, alle Eingaben verwerfen.
-    bool skipModeLogic = false;
-    if (currentMeasureState != MEASURE_IDLE || isAsyncSpotBusy()) {
-      if (isMeteringActive()) handleMeteringSession(false, false, false, false, false);
-
-            // Not-Aus: START als Abbruchsignal während aktiver Spektralmessung zulassen.
-            if (currentMeasureState != MEASURE_IDLE && (evStart || probeEvt == EVT_T2_CLICK)) {
-                abortMeasurementWithError("ABORT");
-                probeEvt = EVT_NONE;
-            }
-
-      oldPosSoft = curSoft;
-      oldPosHard = curHard;
-      oldPosGrade = curGrade;
-      skipModeLogic = true;
-  }
-
-  // =====================================================================
-  // 5. INPUT MERGING & MODE DISPATCH
-  // =====================================================================
-  // Lokale Hardware (Taster, Encoder) und Remote-Events (ESP-NOW) werden
-  // ZUERST in logische Action-Flags zusammengefuehrt. Die Modi wissen
-  // nicht, woher der Klick kam. → Single Source of Truth
-  // =====================================================================
-  if (!skipModeLogic) {
-
-    double evStepFactor = 1.0;
-    if (globalStepMode == STEP_HALF)  evStepFactor = 0.5;
-    if (globalStepMode == STEP_THIRD) evStepFactor = 1.0/3.0;
-    if (globalStepMode == STEP_SIXTH) evStepFactor = 1.0/6.0;
-
-    // -----------------------------------------------------------------
-    // A) TIMER LAEUFT → nur Stop erlauben
-    // -----------------------------------------------------------------
-    if (starttime != 0) {
-        bool actionStop = evStart
-                       || (probeEvt == EVT_T2_CLICK)
-                       || (probeEvt == EVT_T1_CLICK);
-        if (actionStop) {
-            stopTimer();
-            if (probeConnected)
-                sendProbeRender("[ STOPPED ]", "Timer aborted", "", nullptr, HAPTIC_CLICK, PMODE_IDLE);
-        }
-    }
-    // -----------------------------------------------------------------
-    // B) METERING AKTIV → Spot/Save/Toggle/Cancel (lokal + remote)
-    // -----------------------------------------------------------------
-    else if (isMeteringActive()) {
-        bool actionAddLocal  = gradeShort;
-        bool actionAddRemote = (probeEvt == EVT_T2_CLICK);
-        bool actionSave      = evEnter || (probeEvt == EVT_ENC_CLICK);
-        bool actionToggle    = (currentMode == MODE_SG) &&
-                               (evBack || probeEvt == EVT_T1_CLICK
-                                || probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN);
-        bool actionCancel    = (currentMode != MODE_SG) &&
-                               (evBack || probeEvt == EVT_T1_CLICK);
-        bool actionReset     = gradeLong;
-
-        if (actionAddRemote) {
-            // Remote-Messung: Flash-Handshake (C6 misst ueber Probe-Sensor)
-            startFlashHandshake();
-        } else {
-            // Lokal: addSpot startet non-blocking Async-Spot (S3-Sensor)
-            handleMeteringSession(actionAddLocal, actionSave, actionToggle, actionReset, actionCancel);
-        }
-    }
-    // -----------------------------------------------------------------
-    // C) IDLE / BURN → Meter starten, Timer, Encoder, Burn-Toggle
-    // -----------------------------------------------------------------
-    else {
-        // Metering starten (lokal: Grade-Short, remote: T2 im Nicht-Burn)
-        bool actionStartMeter = gradeShort
-                             || (probeEvt == EVT_T2_CLICK && burnMode == BURN_OFF);
-        if (actionStartMeter) {
-            startMeteringSession();
-        }
-
-        // Timer starten (lokal: Start-Taster, remote: T2 im Burn-Modus)
-        else {
-            bool actionTimerToggle = evStart
-                                  || (probeEvt == EVT_T2_CLICK && burnMode != BURN_OFF);
-            if (actionTimerToggle) {
-                if (starttime == 0) {
-                    startTimer();
-                    if (probeConnected)
-                        sendProbeRender("[ EXPOSURE ]", "Timer started", "", nullptr, HAPTIC_CLICK, PMODE_BURN);
-                } else {
-                    stopTimer();
-                }
-            }
-
-            // EV-Stufe durchschalten (lokal: Enter, remote: Enc-Click)
-            bool actionStepCycle = evEnter || (probeEvt == EVT_ENC_CLICK);
-            if (actionStepCycle) {
-                int nextStep = (int)globalStepMode + 1;
-                if (nextStep > 3) nextStep = 0;
-                globalStepMode = (StepSize)nextStep;
-                beepValue();
-                triggerInfo();
-            }
-
-            // --- Lokale Encoder ---
-            if (dSoft != 0) {
-                if (currentMode == MODE_BW) time_bw *= pow(2.0, dSoft * evStepFactor);
-                else if (currentMode == MODE_SG) time_soft *= pow(2.0, dSoft * evStepFactor);
-                validateTimes();
-                triggerInfo();
-                oldPosSoft = curSoft;
-            }
-            if (dHard != 0 && currentMode == MODE_SG) {
-                if (time_hard < TIME_MIN_S) time_hard = TIME_MIN_S;
-                else time_hard *= pow(2.0, dHard * evStepFactor);
-                validateTimes();
-                triggerInfo();
-                oldPosHard = curHard;
-            }
-            if (dGrade != 0) {
-                if (burnMode != BURN_OFF) {
-                    burnEv += (dGrade * evStepFactor);
-                    burnEv = constrain(burnEv, 0.0, 3.0);
-                    beepValue();
-                } else if (currentMode == MODE_BW) {
-                    grade_bw += (dGrade * 0.1);
-                    grade_bw = constrain(grade_bw, 0.0, 5.0);
-                    validateTimes();
-                    updateGradeMath();
-                }
-                triggerInfo();
-                oldPosGrade = curGrade;
-            }
-
-            // --- Remote Encoder (C6 Drehgeber) ---
-            if (probeEvt == EVT_ENC_UP || probeEvt == EVT_ENC_DOWN) {
-                double dir = (probeEvt == EVT_ENC_UP) ? 1.0 : -1.0;
-                if (burnMode != BURN_OFF) {
-                    burnEv += (dir * evStepFactor);
-                    burnEv = constrain(burnEv, 0.0, 3.0);
-                    beepValue();
-                } else if (currentMode == MODE_BW) {
-                    time_bw *= pow(2.0, dir * evStepFactor);
-                } else if (currentMode == MODE_SG) {
-                    time_soft *= pow(2.0, dir * evStepFactor);
-                }
-                validateTimes();
-                triggerInfo();
-            }
-
-            // --- Burn-Mode Toggle (langer Grade-Encoder Druck) ---
-            if (gradeLong) {
-                if (currentMode == MODE_SG) {
-                    if (burnMode == BURN_OFF) burnMode = BURN_SG_G0;
-                    else if (burnMode == BURN_SG_G0) burnMode = BURN_SG_G5;
-                    else burnMode = BURN_OFF;
-                } else {
-                    if (burnMode == BURN_OFF) { burnMode = BURN_BW; burnGrade = grade_bw; }
-                    else burnMode = BURN_OFF;
-                }
-                burnEv = 0.0;
-                beepValue();
-                triggerInfo();
-            }
-        }
-    }
-  } // end if (!skipModeLogic)
-
-  // =====================================================================
-  // 6. HOUSEKEEPING (immer ausgefuehrt, auch waehrend Messung)
-  // =====================================================================
-
-  // --- TEMPERATUR MESSUNG (Alle 2 Sekunden) ---
-  static unsigned long lastTemp = 0;
-  static bool tempRequested = false;
-
-  if (millis() - lastTemp > 2000) {
-    if (tempSensorOK) {
-        if (!tempRequested) {
-            sensors.requestTemperatures();
-            tempRequested = true;
-        } else {
-            float t = sensors.getTempCByIndex(0);
-            if (t > -100 && t < 150) tempAlu = t;
-            tempRequested = false;
-        }
-    }
-    if (bmpOK && bmpPtr != nullptr) {
-       float t = bmpPtr->readTemperature();
-       if (!isnan(t) && t > -50 && t < 80) tempRoom = t;
-    }
-    lastTemp = millis();
-  }
-
-  // --- UI UPDATE (100ms) ---
-  static unsigned long lastUI = 0;
-  if (millis() - lastUI > 100) {
-    updateNextionUI(false);
-    lastUI = millis();
-  }
-
-  // --- PROBE DISPLAY UPDATE (250ms) ---
-  if (probeConnected && (millis() - lastRemotePacketMs > 5000)) {
-      probeConnected = false;
-  }
-  {
-    static unsigned long lastProbeUpdate = 0;
-    if (probeConnected && millis() - lastProbeUpdate > 250) {
-        updateProbeDisplay();
-        lastProbeUpdate = millis();
-    }
-  }
-
-    // --- RUNTIME AUDIT TELEMETRY (nur bei Aenderung) ---
-    {
-        static uint32_t lastDropPkts = 0;
-        static uint32_t lastOverruns = 0;
-        static unsigned long lastAuditPrint = 0;
-        if (millis() - lastAuditPrint > 500) {
-            uint32_t dropNow = totalDroppedPackets;
-            uint32_t overNow = probeEventOverruns;
-            if (dropNow != lastDropPkts || overNow != lastOverruns) {
-                Serial.printf("[AUDIT] drop=%lu overrun=%lu qPending=%d conn=%d fh=%d\n",
-                    (unsigned long)dropNow,
-                    (unsigned long)overNow,
-                    probeEventPending ? 1 : 0,
-                    probeConnected ? 1 : 0,
-                    probeFlashActive ? 1 : 0);
-                lastDropPkts = dropNow;
-                lastOverruns = overNow;
-            }
-            lastAuditPrint = millis();
-        }
-    }
-
-  delay(5);
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }

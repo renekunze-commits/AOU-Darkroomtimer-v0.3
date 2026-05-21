@@ -1,319 +1,173 @@
-extern volatile uint32_t totalDroppedPackets;
 #ifndef GLOBALS_H
 #define GLOBALS_H
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include <Adafruit_NeoPixel.h>
+#include <freertos/queue.h>
 #include <Adafruit_TSL2591.h>
 #include <Adafruit_TSL2561_U.h>
 #include <ESP32Encoder.h>
 #include <Wire.h>
 #include "rgb_lcd.h"
+#include <NeoPixelBus.h>
 #include "Types.h"
 #include "Config.h"
 #include <Adafruit_BMP280.h>
-#include <esp_heap_caps.h>          // heap_caps_malloc() für PSRAM-Allokation
+#include <DallasTemperature.h>
+#include <esp_heap_caps.h>
+#include <Adafruit_BME280.h>
 
-// =============================================================================
-// GLOBALER ZUSTAND (Globals.h)
-//
-// Zweck:
-// - Definiert die zentralen Hardware-Instanzen (Sensoren, Displays, LEDs)
-// - Stellt globale Zustandsvariablen (Timer, Messergebnisse, UI Overlay) zur
-//   Verfügung, die von verschiedenen Modulen gemeinsam genutzt werden.
-// Hinweise:
-// - Verwende möglichst Getter/Setter in neuen Modulen statt direktem Zugriff,
-//   aber für das bestehende, stark gekoppeltes Codebase sind diese externen
-//   Variablen pragmatisch. Neue Interfaces können die Abhängigkeiten reduzieren.
-// =============================================================================
-// HARDWARE INSTANZEN
-// =============================================================================
-// I2C Busse
-extern TwoWire& I2C_SLOW;   // Bus 0 (Alias für Wire)
-extern TwoWire I2C_FAST;    // Bus 1 (Eigene Instanz)
+extern SemaphoreHandle_t gTimerMutex;      
+extern SemaphoreHandle_t gPixelMutex;      
+extern SemaphoreHandle_t xI2CMutex;        
+extern SemaphoreHandle_t xShadowMutex;     
+extern SemaphoreHandle_t xNexMutex;
 
-// Sensoren
-extern Adafruit_TSL2591 tslBase;    // Vormessung (Bus 0)
-extern Adafruit_TSL2561_Unified tslLive;  // Live-Regelung (Bus 1)
-extern rgb_lcd lcd;  // Grove RGB LCD 16x2
-extern Adafruit_BMP280* bmpPtr;  // BMP280 Pointer (wird in setup() erstellt)
-extern bool bmpOK;
+extern QueueHandle_t xInputQueue;
+extern QueueHandle_t xSoundQueue;
+extern LCDShadow lcdShadow;
 
-// NeoPixel Matrix (256 LEDs = 16x16) - Buffer in PSRAM für Stromsparung im SRAM
-extern Adafruit_NeoPixel pixels;
+extern Adafruit_TSL2591 tslBase;
+extern Adafruit_TSL2561_Unified& tslLive;
+extern Adafruit_TSL2561_Unified tslHead;
+extern rgb_lcd lcd;
+extern NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> pixels;
 
-// Encoder Objekte
+// ROOT CAUSE FIX: Alle 4 Encoder global deklarieren
 extern ESP32Encoder encSoft;
 extern ESP32Encoder encHard;
 extern ESP32Encoder encGrade;
+extern ESP32Encoder encMode; 
 
-// Taster Zustände (aus HW_Input)
-extern BtnState sEnter;
-extern BtnState sBack;
-extern BtnState btnStart;
-extern BtnState btnRedLed; // Pin 21 - NeoPixel Red LED
-extern BtnState btnWhiteLed; // Pin 14 - NeoPixel White LED
+extern Adafruit_BMP280* bmpPtr;
+extern Adafruit_BME280* bmePtr;
+extern DallasTemperature sensors;
+extern bool isBME280;
 
-// Screen off override for btSCR logic
-extern bool screenOffOverride;
-
-// =============================================================================
-// SYSTEM STATE
-// =============================================================================
-extern SettingsObject globalSet;
-
-// =============================================================================
-// PSRAM-OPTIMIERUNG: PaperBank (20 Profile × ~120 Bytes ≈ 2.4 KB)
-// Wird in den externen PSRAM ausgelagert, um internen SRAM für zeitkritische
-// Tasks (I2C-Interrupts, FreeRTOS-Stacks, WiFi/ESP-NOW) freizuhalten.
-// Das Makro "paperBank" leitet alle bestehenden Zugriffe automatisch über
-// den Pointer um → kein Code muss angepasst werden.
-// =============================================================================
-extern PaperBank* paperBankPtr;
-#define paperBank (*paperBankPtr)
-
-extern bool settingsDirty;
-extern unsigned long lastSettingChange;
-
-extern bool tslBaseOK;
-extern bool tslLiveOK;
-extern bool lcdOK;
-extern bool nextonOK;
-extern bool tempSensorOK;
-extern bool neoPixelOK;
-extern bool overheatLock;
-extern double tempAlu;
-extern double tempRoom;
+extern bool tslBaseOK, tslLiveOK, tslHeadOK, bmpOK, bmeOK, lcdOK, neoPixelOK, tempSensorOK;
+extern volatile bool overheatLock;
+extern double tempAlu, tempAmbient, tempRoom, pressRoom, humRoom;
 extern int currentGainIdx;
 
-// Software toggles for lights
-extern bool whiteLatch;
-extern bool safeLatch;
-extern bool roomLatch;
-extern bool sgShiftModeDensity;
+extern bool hwSwitchDoseMode;    
+extern double target_dose, current_dose, spectral_ratio;
+extern double dose_bw, dose_soft, dose_hard, targetDoseSoft, targetDoseHard;
+extern float time_bw, grade_bw, time_soft, time_hard, burnEv;
+extern double burnGrade;
 
-// Tracking & UI Helper
-extern double trackDensityEV;
-extern double trackGradeSteps;
-extern String overlayText;
-extern unsigned long infoEndTime;
-extern int pendingPaperSlot;
+// ROOT CAUSE FIX: starttime MUSS volatile sein (K01 Bug)
+extern volatile unsigned long starttime;
+extern volatile Mode currentMode;
+extern SplitState splitState;
+extern CalStep calState;
+extern BurnMode burnMode;
+extern StepSize globalStepMode;
 
-// Hilfstabellen
+extern uint8_t pwmValGreen, pwmValBlue;
+extern float baseFlux;
 extern int multival[11][3];
 extern double paperSpeed[11];
 
-// Wizards & Unter-Modi
-extern CalStep calState;
-extern bool calAbort;
+extern volatile bool statusEnlargerOn, statusSafeOn, isRoomDarknessActive;
+extern volatile bool safeLatch, whiteLatch, roomLatch, measurementOverrideActive, screenOffOverride, bootScreenActive, setupMenuActive;
+extern volatile bool isPaused, isMeasuring;
 
-extern DensitometerState densState;
-extern DensSubMode densSub;
-extern double densRefLux;
-extern double densBaseFog;
-extern double zone8TargetNet;
+// FIX A1: Zentrale Licht-Sperrlogik
+extern volatile bool lightOperationActive;
 
-// Teststrip / TS
-extern TSState ts;
-extern TSChannel tsCh;
-extern uint8_t tsN;
-extern double tsEv;
-extern uint8_t tsK;
-extern double tsA[10];
-extern double tsSum;
-extern bool tsActiveExposure;
-
-// Measurement
-extern MeasureMode measureMode;
-extern MeasureFocus currentMeasureFocus;
-extern MeasureState currentMeasureState;
-extern float timer_base_seconds;
-extern unsigned long measureUiSinceMs;
-extern double measSoftSum;
-extern int measSoftCount;
-extern double measHardSum;
-extern int measHardCount;
-extern double measBWSum;
-extern int measBWCount;
-extern uint8_t currentZoneHistogram[11];
-extern double targetDoseSoft;
-extern double targetDoseHard;
-
-// Misc globals
-extern bool isPaused;
-extern bool isMeasuring;
-extern bool setupMenuActive;
-
-// =============================================================================
-// WIRELESS SENSOR (ESP-NOW Bidirektional)
-// =============================================================================
-extern bool useWirelessProbe;                    // Die Einstellung (Menu)
-extern volatile double remoteLux;                // Der letzte empfangene Wert
-extern volatile unsigned long lastRemotePacketMs; // Zeitstempel des letzten Pakets
-extern void initWireless();                      // Init Funktion
-
-// Probe Event Queue (geschrieben im Callback, gelesen im Main Loop)
-extern volatile uint8_t probeLastEvent;          // Letztes Event vom Handgerät
-extern volatile float   probeLuxG0;              // Gemessener Grün-Wert (Flash-Handshake)
-extern volatile float   probeLuxG5;              // Gemessener Blau-Wert (Flash-Handshake)
-extern volatile bool    probeEventPending;        // Neues Event wartet auf Verarbeitung
-extern volatile bool    probeConnected;           // Heartbeat empfangen (lebt noch?)
-extern bool             probeFlashActive;         // Flash-Handshake läuft (LED exklusiv)
-extern bool             measurementOverrideActive; // Messung hat direkte Lichtkontrolle
-extern volatile uint32_t probeEventOverruns;      // FIFO Überläufe (Eventverlust unter Last)
-
-// Event-FIFO API (ISR schreibt, Main Loop liest)
-extern bool popProbeEvent(uint8_t &evt, float &luxG0, float &luxG5);
-
-// Sende-Funktionen (S3 → C6)
-extern void sendProbeRender(const char* header, const char* line1, const char* line2,
-                            const uint8_t* histogram, uint8_t haptic, uint8_t mode);
-extern void sendRenderPacketToC6();
-extern void sendProbeMeasureCmd(uint8_t cmd);     // CMD_MEASURE_G0 oder CMD_MEASURE_G5
-extern void sendProbeIdle();                      // CMD_IDLE senden
-
-// Licht-Hardware API für expliziten Flash-Handshake
-extern void setLEDMode(uint8_t mode);
-
-// Task / synchronization
-extern SemaphoreHandle_t gTimerMutex;
-extern SemaphoreHandle_t gPixelMutex;
-extern void initClosedLoopTask();
-
-// =============================================================================
-// PSRAM HILFSFUNKTIONEN
-// =============================================================================
-// Initialisiert PSRAM-basierte Datenstrukturen (PaperBank).
-// Muss früh in setup() aufgerufen werden, BEVOR loadSettings()/initPapers().
-extern void initPSRAMStructures();
-// Gibt PSRAM/Heap-Diagnose auf Serial aus (Debug-Hilfe beim Booten).
-extern void logMemoryInfo();
-
-// Timer helpers
-extern void handleTimer();
-extern void startTimer();
-extern void stopTimer();
-
-// =============================================================================
-// TIMER STATUS & MATHE
-// =============================================================================
-extern unsigned long starttime;
-extern double time_soft;
-extern double time_hard;
-extern double time_bw;
-extern double grade_bw;
-extern double burnEv;
-extern double burnGrade;
-extern uint8_t set_safe;
-extern uint8_t set_focus;
-extern uint8_t set_lcd;
-extern uint8_t set_max;
-extern StepSize globalStepMode;
-
-extern Mode currentMode;
-extern BurnMode burnMode;
-extern SplitState splitState;
-
-// PWM Werte für Matrix (aus Logic_Math)
-extern uint8_t pwmValGreen;
-extern uint8_t pwmValBlue;
-
-// Fehler-Codes für das System
-enum SystemError {
-    ERR_NONE = 0,
-    ERR_MUTEX_TIMEOUT,   // Mutex konnte nicht rechtzeitig genommen werden
-    ERR_SENSOR_LOST,    // TSL2561 antwortet nicht mehr
-    ERR_TASK_OVERLOAD,  // Task braucht länger als 10ms pro Zyklus
-    ERR_I2C_SLOW_FAIL,  // Bus 0 (LCD, TSL2591)
-    ERR_I2C_FAST_FAIL   // Bus 1 (TSL2561)
-};
-
-extern volatile SystemError lastSystemError;
-void logError(SystemError err, String context);
-void saveErrorState(SystemError err);
-SystemError loadErrorState();
-void clearErrorState();
 extern volatile bool softAbortActive;
 extern volatile unsigned long softAbortUntilMs;
 
-// =============================================================================
-// FUNKTIONS PROTOTYPEN
-// =============================================================================
-extern void startCalibrationWizard();
-extern void runCalibrationWizard();
-extern void startTestStripMode();
-extern void runTestStripLoop(char key);
+extern TSState ts;
+extern uint8_t tsN;
+extern double tsEv;
+extern double tsA[10];
+extern uint8_t tsK;
+extern TSChannel tsCh;
+extern double tsSum;
+extern bool tsActiveExposure;
 
-// --- INPUT & LICHT (NEU) ---
+extern DensitometerState densState;
+extern DensSubMode densSub;
+extern double densRefLux, densBaseFog, zone8TargetNet;
+extern double baseDarkLux, probeDarkLux;
+
+extern double paper_iso_p, paper_iso_r;
+extern char activePaperName[32];
+extern PaperBank* paperBankPtr;
+#define paperBank (*paperBankPtr)
+
+extern volatile uint32_t totalDroppedPackets, probeEventOverruns;
+extern volatile bool probeConnected, probeEventPending;
+extern volatile uint8_t probeLastEvent;
+extern volatile float probeLuxG0, probeLuxG5;
+extern volatile double remoteLux;
+extern volatile unsigned long lastRemotePacketMs;
+extern bool probeFlashActive;
+
+extern SettingsObject globalSet;
+extern uint8_t set_safe, set_focus, set_lcd, set_max;
+extern bool useWirelessProbe;
+extern uint8_t currentZoneHistogram[11];
+extern MeasureFocus currentMeasureFocus;
+extern float timer_base_seconds, calibBaseLuxG0, calibBaseLuxG5, calibTimeSeconds;
+extern double trackDensityEV, trackGradeSteps;
+extern String overlayText;
+extern unsigned long infoEndTime;
+extern int pendingPaperSlot;
+extern double measSoftSum, measHardSum, measBWSum;
+extern int measSoftCount, measHardCount, measBWCount;
+extern volatile bool settingsDirty;
+extern volatile unsigned long lastSettingChange;
+// BETA-FIX: Schritt 3 - Signalisierung fuer anstehende Messwert-Uebernahme.
+extern volatile bool bwAutoPending;
+
+void uiUpdateLCD(const char* l1, const char* l2, uint8_t progress = 0);
+void uiTriggerBeep(SoundID id);
+void processLCDShadow();
+void processSoundQueue();
+
+bool allowUiBeeps();
+void beepPattern(const BeepSeg* segs, size_t n);
+void beepNav(); void beepValue(); void beepClick(); void beepOk();
+void beepHint(); void beepWarnLong(); void beepWizardStep();
+void beepWizardSave(); void beepStartPattern(); void beepEndPattern();
+void beepDone(); void beepAlarm();
+
+void HW_InitLights();
+void HW_SetBlackout(bool active);
+void HW_SetSafelight(bool active);
+void HW_SetFocus(bool active);
+void HW_SetEnlargerNeoPixel(uint8_t r, uint8_t g, uint8_t b);
+void HW_EmergencyShutoff();
+
 extern void initInput();
 extern void handleInput();
-extern void handleLights(); 
-// Brücken-Funktion für alte Mode-Dateien:
-extern void PaintLED(int r, int g, int b); 
-extern bool updateButton(BtnState &st, int pin, unsigned long now); // Helper
-extern bool checkButtonPress(BtnState &st, int pin); // Entprellung
-
-// --- LOGIK & MATHE ---
-extern void updateGradeMath();
-extern void validateTimes();
-extern void resetTracking();
-extern double getEffectiveBurnTime();
-extern long secondsToUnits(double s, int tgl); // Fehlt oft in TestStrip
-extern double clampDouble(double val, double minV, double maxV);
-
-// --- SYSTEM ---
-extern void initDisplays();
-extern void updateNextionUI(bool force);
-extern void smartLCD(const char* l1, const char* l2);
-extern void smartLCD(const String& l1, const String& l2);
-extern void triggerInfo();
-extern void markDirty();
-extern void saveSettings();
-extern void loadSettings();
-extern void startMeteringSession();
-extern bool isMeteringActive();
-extern void handleMeteringSession(bool addSpot, bool saveApply, bool toggleChannel, bool resetAll, bool cancel);
-extern bool triggerSpectralMeasurement();
-extern bool handleMeasurementStateMachine(uint8_t evt, float luxG0, float luxG5);
-extern void abortMeasurementWithError(const char* line1);
-extern void processSpotMeasurement(float luxG0, float luxG5);
-
-// Setup handler available to call from UI
-extern void handleSetup();
-
-// Misc Helpers
+extern void handleLights();
 extern void handleLCDBacklight();
-extern char getNextionKey();
-extern SpotMeas readSpot();
-extern double takeAveragedLux(uint8_t samples, uint16_t delayMs);
-
-// Async Spot Measurement (non-blocking Ersatz für takeAveragedLux)
-extern bool   startAsyncSpot(uint8_t samples, uint16_t intervalMs, uint16_t settleMs);
-extern bool   tickAsyncSpot();       // Pro Frame aufrufen; true = fertig
-extern double getAsyncSpotResult();  // Ergebnis abholen (NAN bei Fehler), resettet State
-extern bool   isAsyncSpotBusy();     // true wenn SETTLE oder SAMPLING
-extern void   cancelAsyncSpot();     // Messung abbrechen
-
+extern void startTimer();
+extern void stopTimer();
+extern void refreshDisplayVariables();
+extern void applySpotMeasurement(double boardLux);
+extern void modifyExposureByEV(double evDelta);
 extern void wdt_reset();
 
-// --- SOUND ---
-extern void beepNav();
-extern void beepOk();
-extern void beepValue();
-extern void beepClick();
-extern void beepWarnLong();
-extern void beepDone();
-extern void beepStartPattern(); // Für TestStrip
-extern void beepEndPattern();
-extern void beepWizardSave();
+void triggerInfo(); void saveSettings(); void loadSettings();
+void smartLCD(const char* l1, const char* l2); void smartLCD(String l1, String l2);
+void cancelAsyncSpot(); void handleExposureMetronome(unsigned long elapsedMs);
+bool tickAsyncSpot(); double getAsyncSpotResult();
+void enterNextionUploadMode();
 
-// Deklaration der Funktion enterDensMode
-void enterDensMode();
+bool checkButtonPress(BtnState &st, int pin);
+bool updateButton(BtnState &st, int pin, unsigned long now);
+void updateNextionUI(bool force);
+void initWireless(); void clearErrorState();
+bool startAsyncSpot(uint8_t samples, uint16_t intervalMs, uint16_t settleMs);
+bool isAsyncSpotBusy();
 
-void defaultsSettings();
-
-#define MODE_DENSITOMETER 2 // Densitometer-Modus
+extern BtnState sEnter, sBack, btnStart, btnEnc3, btnRedLed, btnWhiteLed;
+extern volatile SystemError lastSystemError;
+extern void saveErrorState(SystemError err);
 
 #endif

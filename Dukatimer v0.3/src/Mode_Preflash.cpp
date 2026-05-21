@@ -1,14 +1,12 @@
-/* Mode_Preflash.ino - Preflash / Flash Calibration Wizard
-
-   Beschreibung:
-   - Ermöglicht das Setzen einer Kurz-Preflash-Dauer für das aktuell aktive Papierprofil.
-   - Bietet einen Test-Flash: Die eigentliche Testauslösung erfolgt non-blocking
-     (Flash-Flag + flashEnd), jedoch nutzt `maybeDoPreflashBeforeExposure()` kurze
-     blocking `delay()`-Aufrufe, um das Preflash korrekt vor einer Aufnahme auszuführen.
-
-   Hinweis (Finding): Die `maybeDoPreflashBeforeExposure()`-Funktion verwendet
-   kurze `delay()`-Aufrufe. Das ist bewusst und in der Praxis unkritisch, könnte
-   aber in zukünftigen Versionen auf non-blocking-Timer umgestellt werden.
+/* Mode_Preflash.cpp - v0.5 Root Cause Edition
+    
+    Zweck: Preflash-Kalibrierung und Ausführung.
+    
+    Architektur-Heilung v0.5:
+    - Vollständige Beseitigung blockierender while-Schleifen.
+    - Integration in die xInputQueue (Core 1).
+    - Thread-sichere PSRAM-Manipulation via gTimerMutex.
+    - HAL-konforme Licht- und Soundsteuerung.
 */
 
 #include <Arduino.h>
@@ -16,162 +14,217 @@
 #include "Config.h"
 #include "Logic_Papers.h"
 #include "DisplayManager.h"
+#include "Logic_Timer.h"
+#include "Logic_Math.h"
 
-extern ESP32Encoder encSoft;
-extern ESP32Encoder encHard;
-extern BtnState sEnter;
-extern BtnState sBack;
-extern void beepNav();
-extern void beepValue();
-extern void beepOk();
-extern void smartLCD(const char* l1, const char* l2);
-extern void saveSettings();
-extern void PaintLED(int r, int g, int b);
+extern void updateNextionUI(bool force);
 
-// Lokale Helper
-static long getEnc1DeltaLocal() {
-  static long lastPos = 0;
-  long newPos = encSoft.getCount() / 2;
-  long delta = newPos - lastPos;
-  lastPos = newPos;
-  return delta;
-} 
+// --- Lokaler Status Wizard ---
+enum PreflashWizardState {
+    PF_IDLE,
+    PF_SET_PARAMS,
+    PF_WAIT_START,
+    PF_PULSING,
+    PF_PICK_THRESH,
+    PF_SAVE_EXIT
+};
 
-static long getEnc2DeltaLocal() {
-  static long lastPos = 0;
-  long newPos = encHard.getCount() / 2;
-  long delta = newPos - lastPos;
-  lastPos = newPos;
-  return delta;
-}
+static PreflashWizardState wizState = PF_IDLE;
+static int pfSteps = 6;
+static double pfDt = 0.05;
+static int currentStep = 0;
+static unsigned long pfTimer = 0;
+static unsigned long pfMsgUntil = 0;
 
-// Non-blocking Preflash state (used by maybeDoPreflashBeforeExposure)
+// --- Lokaler Status Exposure-Preflash ---
 static bool preflashActive = false;
+static int preflashPhase = 0; // 0=idle, 1=on, 2=pause
 static unsigned long preflashUntil = 0;
-static int preflashPhase = 0; // 0=idle, 1=preflash on, 2=pause before exposure
 
-// maybeDoPreflashBeforeExposure:
-// - Führt (wenn konfiguriert) ein kurzes Preflash aus, ist aber NON-BLOCKING.
-// - Muss periodisch aufgerufen werden (z.B. aus main loop / Timer), damit es voranschreitet.
+// =============================================================================
+// 1. EXPOSURE PREFLASH (Wird vom Timer-Task gerufen)
+// =============================================================================
+
 void maybeDoPreflashBeforeExposure() {
-  PaperProfile &PP = getActivePaper();
-  unsigned long now = millis();
-
-  // Wenn Preflash deaktiviert ist, Reset aller Stati und raus
-  if (!(PP.flashEnable && PP.flashThreshS > 0.05)) {
-    preflashActive = false;
-    preflashPhase = 0;
-    return;
-  }
-
-  // Startet das Preflash (einmalig)
-  if (!preflashActive) {
-    PaintLED(255, 255, 255);
-    preflashActive = true;
-    preflashPhase = 1;
-    preflashUntil = now + (unsigned long)(PP.flashThreshS * 1000);
-    return;
-  }
-
-  // Phase: Preflash beenden -> Pause vor eigentlicher Aufnahme
-  if (preflashPhase == 1 && now >= preflashUntil) {
-    PaintLED(0, 0, 0);
-    preflashPhase = 2;
-    preflashUntil = now + 300; // non-blocking Pause
-    return;
-  }
-
-  // Phase: Pause beendet -> Preflash komplett
-  if (preflashPhase == 2 && now >= preflashUntil) {
-    preflashActive = false;
-    preflashPhase = 0;
-    return;
-  }
-}
-
-// Hilfsfunktion: Status abfragen (ob Preflash noch läuft)
-bool preflashBusy() {
-  return preflashActive;
-}
-
-// HIER WURDE startTestStripMode() GELÖSCHT (War doppelt)
-
-// Der "Flash Calibration Wizard"
-void runFlashCalibWizard() {
-  // Reset Encoders
-  getEnc1DeltaLocal();
-  getEnc2DeltaLocal();
-
-  PaperProfile &PP = getActivePaper();
-
-  // --- Parameter-Phase: Level, Color, Steps, dt ---
-  int steps = 6;
-  double dt = 0.05;
-  uint8_t lvl = (PP.flashLevel >= 1 && PP.flashLevel <= 5) ? PP.flashLevel : 2;
-  uint8_t col = (PP.flashColor <= 1) ? PP.flashColor : 0;
-  bool paramLoop = true;
-  while (paramLoop) {
-    wdt_reset(); handleLights(); DM_loop();
+    // Grounding: Nur ausführen, wenn konfiguriert
+    PaperProfile &PP = getActivePaper();
     unsigned long now = millis();
-    long d1 = getEnc1DeltaLocal();
-    long d2 = getEnc2DeltaLocal();
-    bool evEnter = updateButton(sEnter, PIN_SW_ENTER, now);
-    bool evBack  = updateButton(sBack,  PIN_SW_BACK,  now);
-    if (evBack) { lcd.clear(); return; }
-    if (d1 > 0) { steps = constrain(steps + 1, 3, 10); beepValue(); }
-    if (d1 < 0) { steps = constrain(steps - 1, 3, 10); beepValue(); }
-    if (d2 > 0) { dt = min(0.25, dt + 0.01); beepValue(); }
-    if (d2 < 0) { dt = max(0.01, dt - 0.01); beepValue(); }
-    if (evEnter) { paramLoop = false; beepOk(); }
-    String l1 = "ST:"+String(steps)+" dt:"+String(dt,2);
-    String l2 = String("LV:")+String(lvl)+" "+(col==0?"WHT":"GRN")+" #=OK";
-    smartLCD(l1, l2);
-    delay(10);
-  }
 
-  // --- Testpulse-Phase ---
-  for (int i=0; i<=steps; i++) {
-    wdt_reset(); handleLights(); DM_loop();
-    double tFlash = i * dt;
-    tFlash = max(0.01, min(0.25, tFlash));
-    String L0 = "STEP "+String(i)+"/"+String(steps);
-    String L1 = "FLASH t="+String(tFlash,2)+"s";
-    smartLCD(L0, L1);
-    // Warte auf Start-Taste
-    while (digitalRead(PIN_SW_ENTER) == HIGH) { wdt_reset(); delay(5); }
-    beepOk();
-    PaintLED(col==0?lvl:0, col==1?lvl:0, col==0?lvl:0); // White/Green
-    unsigned long until = millis() + (unsigned long)(tFlash * 1000.0);
-    while (millis() < until) { wdt_reset(); delay(1); }
-    PaintLED(0,0,0);
-    delay(80);
-  }
-
-  // --- Schwellenwert-Auswahl ---
-  smartLCD("Develop strip", "Pick 1.."+String(steps)+" *=ABT");
-  int pick = -1;
-  while (pick == -1) {
-    wdt_reset(); handleLights(); DM_loop();
-    char k = getNextionKey();
-    if (k == '*') { beepWarnLong(); return; }
-    if (k >= '1' && k <= '9') {
-      int v = k - '0';
-      if (v >= 1 && v <= steps) pick = v;
+    if (!(PP.flashEnable && PP.flashThreshS > 0.01)) {
+        preflashActive = false;
+        preflashPhase = 0;
+        if (currentMode == MODE_BW || currentMode == MODE_SG) updateNextionUI(true);
+        return;
     }
-    delay(10);
-  }
-  int idx = max(0, pick - 1);
-  double thresh = idx * dt;
-  thresh = max(0.01, min(0.25, thresh));
 
-  PP.flashCalibrated = true;
-  PP.flashEnable = false;
-  PP.flashLevel = lvl;
-  PP.flashColor = col;
-  PP.flashThreshS = thresh;
-  PP.flashFactor = 1.00;
-  markDirty(); saveSettings();
-  beepWizardSave();
-  smartLCD("THRESH SAVED", String(thresh,2)+"s");
-  delay(800);
+    if (!preflashActive) {
+        // Start: Weißlicht an
+        HW_SetEnlargerNeoPixel(255, 255, 255);
+        preflashActive = true;
+        preflashPhase = 1;
+        preflashUntil = now + (unsigned long)(PP.flashThreshS * 1000.0);
+        if (currentMode == MODE_BW || currentMode == MODE_SG) updateNextionUI(true);
+        return;
+    }
+
+    if (preflashPhase == 1 && now >= preflashUntil) {
+        // Ende Blitz: Dunkelheit
+        HW_SetEnlargerNeoPixel(0, 0, 0);
+        preflashPhase = 2;
+        preflashUntil = now + 300; // Beruhigungs-Pause für das Papier (Post-Wait)
+        if (currentMode == MODE_BW || currentMode == MODE_SG) updateNextionUI(true);
+        return;
+    }
+
+    if (preflashPhase == 2 && now >= preflashUntil) {
+        // Sequenz beendet
+        preflashActive = false;
+        preflashPhase = 0;
+        if (currentMode == MODE_BW || currentMode == MODE_SG) updateNextionUI(true);
+    }
+}
+
+bool preflashBusy() { return preflashActive; }
+
+// =============================================================================
+// 2. FLASH CALIBRATION WIZARD (State Machine)
+// =============================================================================
+
+void startPreflashWizard() {
+    wizState = PF_SET_PARAMS;
+    pfSteps = 6;
+    pfDt = 0.05;
+    pfMsgUntil = millis() + 500;
+    uiUpdateLCD("PREFLASH CALIB", "Set Steps & dt");
+    uiTriggerBeep(SND_OK);
+    updateNextionUI(true);
+}
+
+void runPreflashWizard() {
+    wdt_reset();
+    unsigned long now = millis();
+    if (now < pfMsgUntil) return;
+
+    // Input-Queue konsumieren
+    InputEvent evt;
+    bool startPressed = false;
+    bool backPressed = false;
+    bool enterPressed = false;
+    int encSoftDelta = 0;
+    int encHardDelta = 0;
+
+    while (xQueueReceive(xInputQueue, &evt, 0) == pdTRUE) {
+        if (evt.type == EVT_START_PRESSED) startPressed = true;
+        if (evt.type == EVT_BACK_PRESSED) backPressed = true;
+        if (evt.type == EVT_ENTER_PRESSED) enterPressed = true;
+        if (evt.type == EVT_ENC_SOFT) encSoftDelta += evt.value;
+        if (evt.type == EVT_ENC_HARD) encHardDelta += evt.value;
+    }
+
+    // Globaler Abbruch
+    if (backPressed) {
+        wizState = PF_IDLE;
+        HW_SetEnlargerNeoPixel(0, 0, 0);
+        uiUpdateLCD("PF ABORTED", "");
+        uiTriggerBeep(SND_WARN);
+        updateNextionUI(true);
+        return;
+    }
+
+    switch (wizState) {
+        case PF_SET_PARAMS: {
+            if (encSoftDelta != 0) {
+                pfSteps = constrain(pfSteps + encSoftDelta, 3, 10);
+                uiTriggerBeep(SND_NAV);
+                updateNextionUI(true);
+            }
+            if (encHardDelta != 0) {
+                pfDt = constrain(pfDt + (encHardDelta * 0.01), 0.01, 0.25);
+                uiTriggerBeep(SND_NAV);
+                updateNextionUI(true);
+            }
+
+            char l1[17], l2[17];
+            snprintf(l1, 17, "ST:%d dt:%.2f", pfSteps, pfDt);
+            snprintf(l2, 17, "ENTER=OK  *=ABT");
+            uiUpdateLCD(l1, l2);
+
+            if (enterPressed) {
+                currentStep = 0;
+                wizState = PF_WAIT_START;
+                uiTriggerBeep(SND_OK);
+                updateNextionUI(true);
+            }
+        } break;
+
+        case PF_WAIT_START: {
+            char l1[17];
+            snprintf(l1, 17, "STEP %d/%d", currentStep, pfSteps);
+            uiUpdateLCD(l1, "START=FLASH");
+            
+            if (startPressed) {
+                wizState = PF_PULSING;
+                pfTimer = now;
+                // Turn light on once at transition to avoid repeated updates
+                HW_SetEnlargerNeoPixel(255, 255, 255);
+                uiTriggerBeep(SND_CLICK);
+                updateNextionUI(true);
+            }
+        } break;
+
+        case PF_PULSING: {
+            // Ensure step 0 produces a non-zero flash duration
+            double tFlash = (currentStep + 1) * pfDt;
+            
+            if (now - pfTimer >= (unsigned long)(tFlash * 1000.0)) {
+                HW_SetEnlargerNeoPixel(0, 0, 0);
+                currentStep++;
+                if (currentStep > pfSteps) {
+                    wizState = PF_PICK_THRESH;
+                } else {
+                    wizState = PF_WAIT_START;
+                }
+                pfMsgUntil = now + 100;
+                updateNextionUI(true);
+            }
+        } break;
+
+        case PF_PICK_THRESH: {
+            uiUpdateLCD("Develop Strip", "SOFT-ENC=PICK");
+            if (encSoftDelta != 0) {
+                currentStep = constrain(currentStep + encSoftDelta, 1, pfSteps);
+                uiTriggerBeep(SND_NAV);
+                updateNextionUI(true);
+            }
+            
+            char l2[17];
+            snprintf(l2, 17, "Pick:%d  #=SAVE", currentStep);
+            uiUpdateLCD("Develop Strip", l2);
+
+            if (enterPressed) {
+                if (xSemaphoreTake(gTimerMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    PaperProfile &PP = getActivePaper();
+                    PP.flashThreshS = (currentStep - 1) * pfDt;
+                    PP.flashEnable = true;
+                    PP.flashCalibrated = true;
+                    xSemaphoreGive(gTimerMutex);
+                    
+                    saveSettings();
+                    uiTriggerBeep(SND_DONE);
+                    wizState = PF_SAVE_EXIT;
+                    updateNextionUI(true);
+                }
+            }
+        } break;
+
+        case PF_SAVE_EXIT:
+            uiUpdateLCD("THRESH SAVED", "Press START");
+            if (startPressed) {
+                wizState = PF_IDLE;
+                updateNextionUI(true);
+            }
+            break;
+
+        default: break;
+    }
 }

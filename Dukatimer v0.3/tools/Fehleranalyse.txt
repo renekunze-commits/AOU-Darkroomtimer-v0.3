@@ -1,0 +1,102 @@
+du bist senior c++ architekt mit tiefem verständnist für esp32 c6 und s3; dazu einem sehr tiefen verständnis für analoge fotografie und der entwicklung von ui und arbeitsabläufen.
+
+Analysiere Entwicklung UI.txt und Pflichtenheft.txt; gleiche den Code dagegen ab.
+
+Aktueller Stand des Projekts, das Projekt soll von der Alpha in die Beta Phase überführt werden, derzeit erfolgt die Anzeige des UIs ausschließlich auf dem LCD das Nextion ist derzeit nicht funktional. Es gibt offensichtliche brüche im Bedienablauf,
+
+Der Workflow der Basisfunktion SG bzw BW Modus-Wählen - Messen - Gradation und Zeit berechnen - berechnete werte übernehmen ist derzeit nicht funktional. Analysiere den Code eingehend, prüfe Logik und Abhängigkeiten finde welche Stellen verantwortlich für die Probleme sind, benenne den root-cause; erstelle ausführliche ToDo-Liste um Fehler zu prüfen und im nächsten Arbeitsgang step by step zu fixen
+
+Ich prüfe zuerst die Anforderungsdokumente und die vorhandenen Repo-Notizen, dann gleiche ich den aktuellen Workflow im Code dagegen ab und arbeite die Root-Causes für die Brüche im SG/BW-Ablauf heraus.
+
+Die Spezifikation ist deutlich BW/SG-zentriert, das Pflichtenheft im Ordner Timer ist dagegen ein anderes Produktprofil und nur begrenzt passend. Als Nächstes trace ich den realen Bedienpfad im Dukatimer-Code: Moduswahl, Mess-Trigger, Berechnung, Übernahme der Werte und die UI-Ausgabe auf LCD versus Nextion.
+
+Ich habe bereits einen ersten Bruch gefunden: die Anforderungslage ist im Dukatimer-Dokument konsistent, aber die Implementierung wirkt als Mischzustand aus LCD-first, teilweise Nextion-gebundenen Overlays und später eingezogenen Root-Cause-Fixes. Ich lege jetzt den Analysepfad offen und ziehe die Kernmodule gemeinsam nach: Input-Dispatch, BW/SG-Modi, Mess-Engine, Mathematik, Anzeige-Refresh und Zustandsübergaben.
+
+Created 6 todos
+
+Ich lese jetzt die zentralen Implementierungen, um den Soll-Ist-Abgleich nicht auf Suchtreffer, sondern auf den echten Zustands- und Datenfluss zu stützen.
+
+Die zentrale Schwachstelle zeichnet sich ab: Messen und Anwenden sind im Code nicht als sauberer, durchgehender Workflow modelliert, sondern als mehrere halb überlappende Konzepte. Ich prüfe jetzt die fehlenden Verbindungsstellen: Wo die Messung überhaupt Ergebnisdaten schreibt, wo BW/SG diese lesen, und ob LCD-only Betrieb ohne Nextion denselben Pfad bedienen kann.
+
+Ich ziehe jetzt die verbleibenden Referenzstellen nach, damit die Diagnose nicht an einer lokalen Interpretation hängt: Wer startet Mess-Sessions, wer setzt Fokus Licht/Schatten, wer pflegt timer_base_seconds und wer konsumiert die Funk-Events tatsächlich.
+
+Ich habe jetzt den Kern bestätigt: Es gibt zwei konkurrierende Bedienmodelle im selben Projekt, eines lokal über LCD/Encoder und eines über das C6-Handgerät. Der nächste Schritt ist die modusspezifische Probe-Logik und die Frage, ob der Basis-Workflow ohne C6 überhaupt vollständig erreichbar ist.
+
+Ich prüfe jetzt die mathematischen Übergaben selbst. Entscheidend ist, ob eine Spotmessung im aktuellen Code überhaupt jemals automatisch zu Zieldosis oder Gradation führt, oder ob nur Histogramm und Anzeige aktualisiert werden.
+
+Ich validiere noch die Splitgrade-spezifischen Datenpfade. Wenn Highlights und Shadows im Modell getrennt sein sollen, muss der Code getrennte Speicher oder Auswertungspfade haben; sonst ist der Fokuswechsel nur UI-Kosmetik.
+
+Ich hole mir noch präzise Referenzzeilen für die Problemstellen und schreibe danach die Root-Cause-Liste in Arbeitsreihenfolge aus.
+
+Ich lasse noch eine schnelle Gegenprüfung über den Codebestand laufen, um blinde Flecken in der Analyse zu vermeiden und ungenutzte oder widersprüchliche Pfade sicher zu markieren.
+
+Die Gegenprüfung bestätigt den Kernbefund: Der Messpfad endet aktuell im Histogramm und nicht im Timerzustand. Ich sichere das als Repo-Wissen, damit wir im nächsten Arbeitsgang direkt an den echten Blockern ansetzen können.
+
+Ich prüfe noch einen letzten Verdacht im SG-Startpfad. Dort wird Zeit- und Dosislogik vermischt; wenn sich das bestätigt, ist das ein zusätzlicher harter Funktionsbruch speziell im SG-Dosismodus.
+
+Ich lese die SG-Startsequenz noch einmal isoliert, damit ich die Diagnose auf eine konkrete Stelle festnageln kann und nicht auf einen aus dem Vollfile abgeleiteten Verdacht.
+
+Ich habe die Ursachen jetzt bis auf konkrete Funktionen und Zustandsübergänge heruntergebrochen. Ich schließe die Analyse mit einer priorisierten Root-Cause-Liste und einer umsetzbaren ToDo-Reihenfolge für den nächsten Fix-Durchgang ab.
+
+Befunde
+
+Der Kernworkflow Messen → Berechnen → Übernehmen ist im Code nicht end-to-end implementiert. Die Messung schreibt nur Histogramm und Verhältniswerte, aber keine verbindlichen Timerwerte. In Dukatimer v0.3/src/Logic_Measurement.cpp beendet finalizeMeteringSession() nur den Zustand, und in Dukatimer v0.3/src/Logic_Measurement.cpp bis Dukatimer v0.3/src/Logic_Measurement.cpp erzeugt processSpotMeasurement() nur Zoneneinträge plus spectral_ratio. Das ist der Haupt-Root-Cause für den aktuell gebrochenen BW/SG-Basisablauf.
+
+Splitgrade trennt Highlights und Shadows nur in der UI, nicht in der Mathematik. currentMeasureFocus wird zwar umgeschaltet, aber die Messwerte landen weiterhin in einem einzigen globalen Histogramm. Die Umschaltung sitzt in Dukatimer v0.3/src/HW_Wireless.cpp, die Speicherung weiterhin global in Dukatimer v0.3/src/Logic_Measurement.cpp. Die vorgesehenen getrennten Summen/Zähler existieren nur als ungenutzte Globals in Dukatimer v0.3/src/main.cpp. Damit ist der SG-Workflow fachlich unvollständig.
+
+Die SG-Automatik hängt an einem toten Ankerzustand. calculateAutoSG() liest timer_base_seconds, aber diese Variable wird nur initialisiert und im relevanten Pfad nicht gepflegt. Sie steht in Dukatimer v0.3/src/main.cpp, die Berechnung in Dukatimer v0.3/src/Logic_Math.cpp. Ergebnis: Selbst der vorhandene SG-Auto-Pfad arbeitet nicht auf einer sauber gemessenen Basis, sondern fällt auf alte manuelle Zeiten zurück.
+
+Der SG-Dosismodus ist intern inkonsistent. In Dukatimer v0.3/src/Logic_Timer.cpp bis Dukatimer v0.3/src/Logic_Timer.cpp werden bei SG im Dosisbetrieb erst Split-Zeiten aus time_bw berechnet, dann aber die Belichtung mit dose_soft beziehungsweise dose_hard gestartet. Gleichzeitig synchronisiert Dukatimer v0.3/src/Logic_Timer.cpp refreshDisplayVariables() im Zeitmodus nur dose_bw, nicht aber dose_soft und dose_hard. Das erzeugt Zustandsdrift zwischen Anzeige, Mathematik und tatsächlicher Belichtung.
+
+LCD-only ist für den Messworkflow derzeit nicht vollständig lauffähig. In Dukatimer v0.3/src/Mode_BW.cpp und Dukatimer v0.3/src/Mode_SG.cpp startet die Messung nur bei verbundener Probe; andernfalls meldet der Code explizit, dass lokale Messung nicht implementiert ist. Solange Nextion ausfällt, ist das für Beta ein harter Produktbruch, wenn die C6-Probe nicht den kompletten Ablauf übernimmt.
+
+Die Remote- und Nextion-Anbindung ist zusätzlich inkonsistent. In Dukatimer v0.3/src/HW_Display.cpp wird EVT_MAIN_APPLY auf ENTER gemappt, aber ENTER ist im BW-Idle in Dukatimer v0.3/src/Logic_Timer.cpp praktisch nur ein Bestätigungston. Außerdem ist in Dukatimer v0.3/src/HW_Display.cpp EVT_SG_RESET fälschlich auf das Mess-Event gemappt. Das ist aktuell sekundär, weil Nextion tot ist, aber beim Reaktivieren sofort wieder relevant.
+
+Das herangezogene Pflichtenheft ist wahrscheinlich nicht das Dukatimer-Pflichtenheft, sondern das separate Timer-Projekt. Timer/Pflichtenheft.md beschreibt ein S3/LVGL-Temperatur- und Prozess-Timer-System, während Dukatimer v0.3/Entwicklung UI.txt ein Vergrößerer-/Papierbelichtungs-System spezifiziert. Für die aktuelle Analyse habe ich deshalb Dukatimer v0.3/Entwicklung UI.txt als Primärspezifikation behandelt und das andere Dokument nur als Nebenreferenz.
+
+Root Cause
+Der eigentliche Root-Cause ist architektonisch: Das Projekt besteht aktuell aus drei nur lose gekoppelten Teilsystemen.
+
+Das Messsystem in Dukatimer v0.3/src/Logic_Measurement.cpp sammelt Spots und UI-Daten.
+
+Das SG-Auto-System in Dukatimer v0.3/src/Mode_SG.cpp kann Vorschläge anzeigen und lokal anwenden.
+
+Das Belichtungssystem in Dukatimer v0.3/src/Logic_Timer.cpp und Dukatimer v0.3/src/ExposureEngine.cpp führt Zeiten und Dosen aus.
+
+Zwischen 1 und 2 fehlt der verbindliche Vertragsübergang. Es gibt keinen zentralen, modebewussten Mess-Session-Output wie etwa “gültiger Messsatz mit Baseline, Fokus, Vorschlag, Pending/Applied”. Deshalb endet die Messung heute im Histogramm statt im Timerzustand.
+
+ToDo-Liste für den nächsten Arbeitsgang
+
+Primärspezifikation festziehen. Für Dukatimer muss Dukatimer v0.3/Entwicklung UI.txt die führende Quelle sein; Timer/Pflichtenheft.md sollte nur dann einfließen, wenn einzelne Systemprinzipien bewusst übernommen werden.
+
+Ein zentrales MeteringSessionResult definieren. Es braucht mindestens: Modus BW/SG, Fokus highlights/shadows, Spotliste, Messzähler, Baseline-Snapshot, berechnete Vorschlagswerte, Status empty/pending/applied/cancelled.
+
+startMeteringSession() und finalizeMeteringSession() von Platzhaltern zu echten Workflow-Knoten machen. start muss Sessionzustand sauber initialisieren; finalize muss je nach Modus rechnen und entweder direkt anwenden oder einen bestätigungspflichtigen Preview-Zustand setzen.
+
+BW-Messlogik fachlich fertigstellen. Aktuell gibt es im BW-Pfad keinen echten Übergang von Spotmessung zu time_bw, dose_bw oder grade_bw. Genau dieser Pfad muss spezifiziert und implementiert werden.
+
+SG-Messlogik fachlich trennen. Highlights und Shadows müssen getrennt gespeichert und ausgewertet werden; ein globales Histogramm reicht für UI, aber nicht für die Mathematik.
+
+timer_base_seconds entweder korrekt pflegen oder eliminieren. Wenn die Variable bleiben soll, muss sie bei Sessionstart aus der aktuellen Hauptbelichtung gelatcht werden. Wenn nicht, muss calculateAutoSG() auf einen expliziten Session-Snapshot umgestellt werden.
+
+SG-Zeit- und Dosiszustände entkoppelt, aber konsistent halten. refreshDisplayVariables() muss auch dose_soft und dose_hard im Zeitmodus aktualisieren, oder die Architektur muss klar festlegen, welche Größe autoritativ ist.
+
+Den SG-Dosismodus im Startpfad korrigieren. Vor Engine-Start müssen entweder echte Split-Dosen berechnet werden oder die aus Split-Zeiten resultierenden Dosen aus flux * time erzeugt werden. Der aktuelle Mischzustand ist nicht belastbar.
+
+LCD-only Beta-Workflow explizit definieren. Wenn die C6-Probe Pflicht ist, muss das LCD das klar anzeigen und der Workflow darf nicht so tun, als sei lokale Messung verfügbar. Wenn LCD-only unterstützt werden soll, braucht es einen lokalen Messpfad.
+
+Remote, LCD und Nextion auf denselben Command-Contract bringen. Apply, Reset, Measure, Undo, Cancel müssen unabhängig vom Eingabegerät denselben Zustandsübergang auslösen.
+
+Die Nextion-Mappings bereinigen, bevor das Display wieder aktiviert wird. EVT_SG_RESET und EVT_MAIN_APPLY sind aktuell falsch beziehungsweise wirkungslos.
+
+Für jede Session strukturierte Debug-Logs einbauen. Mindestens: Sessionstart, Fokuswechsel, Spot gespeichert, Vorschlag berechnet, Vorschlag angewendet, Session verworfen.
+
+Einen harten Testplan für Beta definieren. Pflichtfälle:
+
+BW mit C6: messen, undo, anwenden, starten.
+SG mit C6: Highlights/Shadows getrennt messen, Vorschlag prüfen, anwenden, Soft/Hard ausführen.
+Umschalten Zeitmodus/Dosismodus ohne Wertedrift.
+LCD-only ohne Nextion.
+Messung mit Safelight/Blackout aktiv.
+Abbruch mitten in der Messung und mitten in Soft/Hard.
+Erst nach dem sauberen lokalen Workflow die Nextion-Reaktivierung angehen. Sonst wird nur eine zweite, fehlerhafte Eingabeschicht auf einen bereits inkonsistenten Kern gesetzt.

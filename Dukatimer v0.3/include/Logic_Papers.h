@@ -1,21 +1,25 @@
+/* Logic_Papers.h - v0.5 Root Cause Edition
+   Zentrale Verwaltung der Papierdatenbank im PSRAM.
+*/
+
 #ifndef LOGIC_PAPERS_H
 #define LOGIC_PAPERS_H
 
+#include <Arduino.h>
 #include "Types.h"
-
-// Zugriff auf die globale Papierbank (PSRAM-Pointer, siehe Globals.h)
-// Das Makro "paperBank" wird in Globals.h definiert und leitet auf (*paperBankPtr).
-extern PaperBank* paperBankPtr;
 
 // API Methoden
 void initPapers();                    // Beim Start laden
-void selectPaper(uint8_t index);      // Papier wechseln
+void selectPaper(uint8_t index);      // Papier wechseln (Thread-safe)
 PaperProfile& getActivePaper();       // Aktuelles Profil holen
 PaperProfile& getPaper(uint8_t index);// Spezifisches Profil holen
 uint8_t getActivePaperIndex();        // Index des aktiven Papiers
 
-// Messwerte speichern (fuer Gradations-Kalibrierung)
-void setPaperGradeMeasurement(uint8_t grade, double luxSeconds);
+// Messwerte speichern (für manuelle 11-Stufen Gradations-Kalibrierung)
+void setPaperGradeMeasurement(uint8_t gradeIdx, double kSoft, double kHard);
+
+// Automatische Profil-Erstellung (Stouffer Wedge Analyse)
+void calculateAndSavePaperProfile(int stepWhiteG0, int stepBlackG0, int stepWhiteG5, int stepBlackG5);
 
 // Speicherverwaltung
 void savePapers();

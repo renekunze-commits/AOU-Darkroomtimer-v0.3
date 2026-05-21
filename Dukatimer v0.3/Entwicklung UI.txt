@@ -117,22 +117,23 @@ Enc 1 Taster (Kurz)	EV-Step umschalten	Ändert den Multiplikator für Enc 1.
 Enc 1 Taster (Lang)	Spot-Messung starten	Löst die spektrale Mess-Sequenz aus. Berechnet Zieldosis.
 Encoder 2 (Mitte)	Zeit ändern (Linear)	Addiert/Subtrahiert einen fixen Lux-Sekunden-Wert zur Zieldosis.
 Enc 2 Taster (Kurz)	ENTER / Bestätigen (*)	Zentraler Bestätigungs-Taster.
+Enc 2 Taster (Lang)	Reset Time & Grade	Setzt Zeit und Gradation auf die Standardwerte zurück.
 Encoder 3 (Rechts)	Gradation ändern	Ändert das Grün/Blau-Verhältnis.
 Enc 3 Taster (Kurz)	BACK / Abbruch (#)	Bricht aktive Aktionen ab und kehrt zu BW-Idle zurück.
-Enc 3 Taster (Lang)	Reset Time & Grade	Setzt Zieldosis und Spektral-Verhältnis auf Papier-Standard zurück.
+Enc 3 Taster (Lang)	Spot-Messung starten	Löst die spektrale Mess-Sequenz aus. Berechnet Zieldosis.
 Start-Taster	Start / Stopp	Startet die Belichtung (bevorzugt im Closed-Loop Dose-Mode).
 Modus 2: Splitgrade-Modus (SG)
 Hardware-Belegung (SG)
 Bedienelement	Aktion (UI-Sicht)	Interne Verarbeitung (Physik)
 Encoder 1 (Links)	Soft-Zeit ändern (EV)	Skaliert die berechnete Dosis_Soft (Grünkanal) logarithmisch.
 Enc 1 Taster (Kurz)	EV-Step umschalten	Ändert den Multiplikator (1/1 bis 1/6) für alle Encoder.
-Enc 1 Taster (Lang)	Start Soft-Session	Startet den Sammel-Modus für Lichter-Messpunkte (Averaging).
+Enc 1 Taster (Lang)	Spot-Messung starten	Löst die spektrale Mess-Sequenz aus.
 Encoder 2 (Mitte)	Hard-Zeit ändern (EV)	Skaliert die berechnete Dosis_Hard (Blaukanal) logarithmisch.
 Enc 2 Taster (Kurz)	ENTER / Bestätigen (*)	Zentraler Bestätigungs-Taster (Schließt auch Mess-Sessions ab).
-Enc 2 Taster (Lang)	Start Hard-Session	Startet den Sammel-Modus für Schatten-Messpunkte (Averaging).
+Enc 2 Taster (Lang)	Reset Dosen	Setzt Soft- und Hard-Zeit auf die Standardwerte zurück.
 Encoder 3 (Rechts)	Master Helligkeit (Shift)	Geheimwaffe: Verschiebt Dosis_Soft UND Dosis_Hard proportional. Der Bildkontrast bleibt identisch, das Bild wird insgesamt heller/dunkler.
 Enc 3 Taster (Kurz)	BACK / Abbruch (#)	Bricht aktive Aktionen ab (z.B. laufende Session verwerfen).
-Enc 3 Taster (Lang)	Reset Dosen	Setzt Dosis_Soft und Dosis_Hard auf Standardwerte zurück.
+Enc 3 Taster (Lang)	Spot-Messung starten	Löst die spektrale Mess-Sequenz aus.
 Start-Taster	Start / Stopp	Führt sequenzielle Belichtung aus (Erst Soft, dann Hard).
 Modus 3: Probestreifen-Modus (Test Strip)
 Der Teststreifen ist ein temporäres UI-Overlay. Er generiert ausschließlich Belichtungsreihen (Dosis-Sequenzen). Der Modus erzwingt einen "Closed Loop": Das Ergebnis der Sichtprüfung wird direkt als neue System-Basis übernommen.

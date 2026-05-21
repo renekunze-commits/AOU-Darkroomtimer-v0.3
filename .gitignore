@@ -2,7 +2,8 @@
 **/.pio/
 **/build/
 **/.vscode/
-
+wifi_config.h
 # Betriebssystem-Dateien
 .DS_Store
 Thumbs.db
+**//.tmp.driveupload/
