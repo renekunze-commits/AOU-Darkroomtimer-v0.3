@@ -1,113 +1,170 @@
+/* HW_Input.cpp - v0.5 Root Cause Edition
+   
+   ARCHITEKTUR-MAXIME:
+   - Deterministik: Encoder-Polling über Hardware-Counter (PCNT).
+   - Taster: Absolute Verriegelung (Temporal Lockout) im Realtime-Task.
+     Schützt zu 100% vor Feder-Prellen schwerer mechanischer Schalter.
+   - Grounding: Direkte Event-Generierung für die xInputQueue.
+*/
+
 #include <Arduino.h>
-#include <ESP32Encoder.h> // Library: ESP32Encoder by Kevin Harrington
+#include <ESP32Encoder.h>
 #include "Config.h"
 #include "Globals.h"
 #include "Types.h"
 
-/*
-  HW_Input.cpp
-  - Initialisiert Encoder und Taster
-  - Stellt Entprellungslogik bereit (BtnState)
-  - Bietet kleine Helper für Mode-Module (updateButton / checkButtonPress)
-
-  Encoder-Konvention:
-  - encSoft: Navigation / Zeitänderung
-  - encHard: Wertänderung / Menü
-  - encGrade: Gradation / Burn
-*/
-
 // =============================================================================
-// GLOBALE OBJEKTE
+// GLOBALE OBJEKTE & SPEICHER
 // =============================================================================
 
-ESP32Encoder encSoft;  // Encoder 1 (Links): Zeit / Soft
-ESP32Encoder encHard;  // Encoder 2 (Mitte): Hard / Menü
-ESP32Encoder encGrade; // Encoder 3 (Rechts): Gradation / Burn
+// Encoder-Instanzen (Nutzen ESP32 Hardware Pulse Counter)
+ESP32Encoder encSoft;  // Encoder 1 (Links)
+ESP32Encoder encHard;  // Encoder 2 (Mitte)
+ESP32Encoder encGrade; // Encoder 3 (Rechts)
+ESP32Encoder encMode;  // Encoder 4 (Ganz Rechts) - Master Mode Dial
 
-// Speicher für alte Positionen (für Delta-Berechnung)
-long oldPosSoft = 0;
-long oldPosHard = 0;
-long oldPosGrade = 0;
+// Delta-Tracking für Encoder
+static long lastPosSoft = 0;
+static long lastPosHard = 0;
+static long lastPosGrade = 0;
+static long lastPosMode = 0;
 
-// Taster Zustände (Entprellung) - tatsächliche Definitionen
-BtnState sEnter;  // Extern deklariert in `Globals.h`
+// Legacy-Stati für Abwärtskompatibilität
+BtnState sEnter;
 BtnState sBack;
-BtnState btnStart;  // Wird auch in main.cpp verwendet
-BtnState btnEnc3; // Grade/Shift (intern)
-BtnState btnRedLed; // Pin 21 - NeoPixel Red LED
-BtnState btnWhiteLed; // Pin 14 - NeoPixel White LED
+BtnState btnStart;
+BtnState btnEnc3;
+BtnState btnRedLed;
+BtnState btnWhiteLed;
 
 // =============================================================================
-// HILFSFUNKTIONEN
+// ROBUSTES TASTER-POLLING (Temporal Lockout / Absolute Sperrzeit)
 // =============================================================================
 
-// Initialisierung (wird im setup() aufgerufen)
+// ROOT CAUSE FIX: 200ms absolute Totzeit (Taubheit) nach jedem Flankenwechsel.
+// Verhindert zu 100% doppelte Start-Events beim Loslassen des Tasters.
+static constexpr uint32_t LOCKOUT_MS = 200; 
+
+struct PolledButton {
+    int pin;
+    InputEventType eventType;
+    bool stableState;
+    uint32_t lastEventTime;
+};
+
+// Unsere 3 Haupt-Taster, die gepollt werden
+static PolledButton btns[] = {
+    { PIN_SW_ENTER, EVT_ENTER_PRESSED, false, 0 },
+    { PIN_SW_BACK,  EVT_BACK_PRESSED,  false, 0 },
+    { PIN_START,    EVT_START_PRESSED, false, 0 }
+};
+static const int numBtns = 3;
+
+// =============================================================================
+// INITIALISIERUNG
+// =============================================================================
+
 void initInput() {
-    // 1. Encoder Hardware aktivieren
-    // WICHTIG für S3: Interne Pullups aktivieren!
     ESP32Encoder::useInternalWeakPullResistors = UP;
-
-    // Pins zuweisen (Halb-Quad ist meist besser für Rasterung)
+    
+    // ROOT CAUSE FIX: Zurück zum HalfQuad-Modus.
+    // KY-040 Encoder liegen mechanisch oft so, dass SingleEdge
+    // zu verschluckten Erst-Klicks führt.
     encSoft.attachHalfQuad(ENC_SOFT_A, ENC_SOFT_B);
     encHard.attachHalfQuad(ENC_HARD_A, ENC_HARD_B);
     encGrade.attachHalfQuad(ENC_GRADE_A, ENC_GRADE_B);
+    encMode.attachHalfQuad(ENC_MODE_A, ENC_MODE_B);
 
-    // Startwerte nullen
     encSoft.setCount(0);
     encHard.setCount(0);
     encGrade.setCount(0);
-    
-    // Taster Pins sind schon im main.cpp setup() als INPUT_PULLUP gesetzt,
-    // aber sicher ist sicher:
-    pinMode(PIN_SW_ENTER, INPUT_PULLUP);
-    pinMode(PIN_SW_BACK, INPUT_PULLUP);
-    pinMode(PIN_SW_GRADE, INPUT_PULLUP);
-    // PIN_START ist auch schon gesetzt.
+    encMode.setCount(0);
 
-    // Initialisiere Taster-Stati (sicherstellen, dass Felder definiert sind)
-    sEnter.lastState = true; sEnter.isPressed = false; sEnter.lastDebounceTime = 0;
-    sEnter.pressStartMs = 0; sEnter.lastRepeatMs = 0; sEnter.intervalMs = 0; sEnter.longPressDuration = 500;
+    // Taster als reine Inputs (mit Pullup) initialisieren. Keine Interrupts mehr!
+    for (int i = 0; i < numBtns; i++) {
+        pinMode(btns[i].pin, INPUT_PULLUP);
+    }
 
-    sBack = sEnter;
-    btnStart = sEnter;
-    btnEnc3 = sEnter;
-    btnRedLed = sEnter;
-    btnWhiteLed = sEnter;
+    sEnter.lastState = true;
+    sBack.lastState = true;
+    btnStart.lastState = true;
 }
 
-// Button Update Helper (Entprellung)
-// Gibt true zurück, wenn der Taster frisch gedrückt wurde (Falling Edge).
-// Zusätzlich werden Long-Press/Repeat-Parameter im BtnState vorbereitet
-// (z. B. pressStartMs, lastRepeatMs), die bei Bedarf später genutzt werden können.
+// =============================================================================
+// INPUT POLLING (Wird exakt alle 1ms vom TaskRealtime auf Core 1 gerufen)
+// =============================================================================
+
+void HW_Input_Process() {
+    uint32_t now = millis();
+
+    // 1. DREH-ENCODER AUSLESEN
+    auto pollEncoder = [](ESP32Encoder& enc, long& lastPos, InputEventType type, uint32_t timestamp) {
+        // ROOT CAUSE FIX: Der Software-Teiler (/ 2) wie gestern.
+        // Glättet das mechanische Spiel zwischen den Rastungen zuverlässig aus.
+        long curPos = enc.getCount() / 2; 
+        
+        if (curPos != lastPos) {
+            InputEvent evt;
+            evt.type = type;
+            evt.value = (int32_t)(curPos - lastPos);
+            evt.timestamp = timestamp;
+            xQueueSend(xInputQueue, &evt, 0);
+            lastPos = curPos;
+        }
+    };
+
+    pollEncoder(encSoft,  lastPosSoft,  EVT_ENC_SOFT, now);
+    pollEncoder(encHard,  lastPosHard,  EVT_ENC_HARD, now);
+    pollEncoder(encGrade, lastPosGrade, EVT_ENC_GRADE, now);
+    pollEncoder(encMode,  lastPosMode,  EVT_ENC_MODE, now);
+
+    // 2. TASTER AUSLESEN (Absolute Verriegelung statt wackeligem Edge-Tracking)
+    for (int i = 0; i < numBtns; i++) {
+        bool rawPressed = (digitalRead(btns[i].pin) == LOW); // LOW = Taster gedrückt
+
+        // Wenn die Sperrzeit (200ms) abgelaufen ist, dürfen wir Statusänderungen akzeptieren
+        if (now - btns[i].lastEventTime > LOCKOUT_MS) {
+            
+            if (rawPressed && !btns[i].stableState) {
+                // Taster wurde GANZ NEU gedrückt
+                btns[i].stableState = true;
+                btns[i].lastEventTime = now; // Sperre (Totzeit) aktivieren!
+                
+                InputEvent evt;
+                evt.type = btns[i].eventType;
+                evt.value = 0;
+                evt.timestamp = now;
+                xQueueSend(xInputQueue, &evt, 0);
+            } 
+            else if (!rawPressed && btns[i].stableState) {
+                // Taster wurde LOSGELASSEN
+                btns[i].stableState = false;
+                btns[i].lastEventTime = now; // Auch beim Loslassen für 200ms sperren! (Gegen Feder-Prellen)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// LEGACY COMPATIBILITY LAYER
+// =============================================================================
 bool checkButtonPress(BtnState &st, int pin) {
-    bool currentRaw = (digitalRead(pin) == LOW); // LOW = Gedrückt
+    bool currentRaw = (digitalRead(pin) == LOW);
     unsigned long now = millis();
     bool eventTriggered = false;
 
-    // Raw-change: start debounce timer
-    if (currentRaw != st.lastState) {
-        st.lastDebounceTime = now;
-        st.lastState = currentRaw;
-    }
-
-    // Debounce abgeschlossen?
-    if ((now - st.lastDebounceTime) > 50) { // 50ms Debounce
-        if (st.isPressed != currentRaw) {
+    // Nutzt für Legacy-Funktionen ebenfalls eine simple Lockout-Variante
+    if (now - st.lastDebounceTime > 150) {
+        if (currentRaw != st.isPressed) {
             st.isPressed = currentRaw;
-            if (st.isPressed) {
-                // Neuer Druck erkannt
-                st.pressStartMs = now;
-                st.lastRepeatMs = now;
-                eventTriggered = true;
-            }
+            st.lastDebounceTime = now;
+            if (st.isPressed) eventTriggered = true;
         }
     }
     return eventTriggered;
 }
 
-// updateButton ist eine kleine Kompatibilitäts-Hülle damit alte Signaturen
-// in Mode_*.cpp unverändert bleiben. Sie delegiert an checkButtonPress.
 bool updateButton(BtnState &st, int pin, unsigned long now) {
-    (void)now; // zur Kompatibilität mit Signatur
+    (void)now;
     return checkButtonPress(st, pin);
-} 
+}
